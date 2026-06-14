@@ -1,0 +1,49 @@
+version: "3.8"
+
+services:
+  # db 0, port 5430
+  db0:
+    image: postgres:18.4-alpine3.23
+    container_name: local_pg_db0
+    restart: unless-stopped
+    network_mode: "host"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: luozhenzuishuai
+      POSTGRES_DB: my_cluster
+      POSTGRES_HOST_AUTH_METHOD: trust
+    # ports:
+    #   - "5430:5432"
+    command: >
+      postgres 
+      -c wal_level=logical 
+      -c max_wal_senders=10 
+      -c max_replication_slots=10
+      -p 5430
+    shm_size: "512mb"
+    volumes:
+      - /Users/luozhen/data/db0:/var/lib/postgresql/data/pgdata
+
+  # db 1, port 5431
+  db1:
+    image: postgres:18.4-alpine3.23
+    network_mode: "host"
+    container_name: local_pg_db1
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: luozhenzuishuai
+      POSTGRES_DB: my_cluster
+      POSTGRES_HOST_AUTH_METHOD: trust
+
+    # ports:
+    #   - "5431:5432"
+    command: >
+      postgres 
+      -c wal_level=logical 
+      -c max_wal_senders=10 
+      -c max_replication_slots=10
+      -p 5431
+    shm_size: "512mb"
+    volumes:
+      - /Users/luozhen/data/db0:/var/lib/postgresql/data/pgdata

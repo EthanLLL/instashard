@@ -1,0 +1,185 @@
+defmodule Instashard.ProxyListener do
+  use GenServer
+  require Logger
+
+  def start_link(opts) do
+    port = Keyword.get(opts, :port, 5400)
+    GenServer.start_link(__MODULE__, port, name: __MODULE__)
+  end
+
+  @impl true
+  def init(port) do
+    # :binary
+    # packet: 0
+    # active: true - Async receive message，{:tcp, socket, data} -> handle_info
+    # reuseaddr: true
+    opts = [:binary, packet: 0, active: true, reuseaddr: true]
+
+    case :gen_tcp.listen(port, opts) do
+      {:ok, listen_socket} ->
+        Logger.info(" [InstaShard] listening: #{port}")
+        send(self(), :accept)
+        state = %{listen_socket: listen_socket}
+        {:ok, state}
+
+      {:error, reason} ->
+        Logger.error("Listening #{port} failed: #{inspect(reason)}")
+        {:stop, reason}
+    end
+  end
+
+  @impl true
+  def handle_info(:accept, %{listen_socket: listen_socket} = state) do
+    case :gen_tcp.accept(listen_socket) do
+      {:ok, client_socket} ->
+        Logger.info(" [InstaShard] New connection")
+
+        # New a process to serve request
+        {:ok, pid} =
+          Task.start_link(fn ->
+            serve_client(client_socket)
+          end)
+
+        # handle socket to task
+        :ok = :gen_tcp.controlling_process(client_socket, pid)
+
+        # Continue
+        send(self(), :accept)
+        {:noreply, state}
+
+      {:error, reason} ->
+        Logger.error("Failed to accept client connection: #{inspect(reason)}")
+        send(self(), :accept)
+        {:noreply, state}
+    end
+  end
+
+  defp serve_client(client_socket) do
+    # Init state
+    state = %{
+      client_socket: client_socket,
+      # Lazy binding DB connection，nil
+      backend_socket: nil,
+      # Transaction status: :none, :pending_begin, :active
+      tx_status: :none
+    }
+
+    # Event loop
+    session_loop(state)
+  end
+
+  defp session_loop(state) do
+    receive do
+      # Packet from client
+      {:tcp, src_socket, raw_packet} when src_socket == state.client_socket ->
+        Logger.debug("Packet from client: #{inspect(raw_packet, limit: :infinity)}")
+
+        # Handle packet
+        new_state = handle_client_packet(raw_packet, state)
+        session_loop(new_state)
+
+      # Packet from server
+      {:tcp, src_socket, raw_response} when src_socket == state.backend_socket ->
+        # Send packet to client
+        :ok = :gen_tcp.send(state.client_socket, raw_response)
+        session_loop(state)
+
+      # Connection closed by either client or server
+      {:tcp_closed, _socket} ->
+        Logger.info("Connection closed")
+        if state.backend_socket, do: :gen_tcp.close(state.backend_socket)
+        :gen_tcp.close(state.client_socket)
+        :ok
+
+      {:tcp_error, _socket, reason} ->
+        Logger.error("TCP error: #{inspect(reason)}")
+        if state.backend_socket, do: :gen_tcp.close(state.backend_socket)
+        :gen_tcp.close(state.client_socket)
+        :error
+    end
+  end
+
+  # Match SSL
+  defp handle_client_packet(<<0, 0, 0, 8, 4, 210, 22, 47>>, state) do
+    Logger.info("SSL supported? No!")
+
+    # Send 'N' (ASCII 78)
+    :ok = :gen_tcp.send(state.client_socket, "N")
+
+    state
+  end
+
+  # Match Login
+  defp handle_client_packet(<<_len::32, 0, 3, 0, 0, payload::binary>>, state) do
+  
+    params = String.split(payload, <<0>>, trim: true)
+  
+    Logger.info("Params: #{inspect(params)}")
+
+    config_map = 
+      params
+      |> Enum.chunk_every(2) 
+      |> Map.new(fn [k, v] -> {k, v} end)
+
+    target_db = Map.get(config_map, "database")
+    user_name = Map.get(config_map, "user")
+
+    Logger.info("#{user_name}\" connected to database: \"#{target_db}\"")
+
+    :ok = :gen_tcp.send(state.client_socket, [<<"R", 8::32, 0::32>>, <<"Z", 5::32, "I">>])
+  
+    state
+  end
+
+  # Match SQL
+  defp handle_client_packet(<<"Q", size::32, sql_with_null::binary>>, state) do
+    sql_len = size - 4 - 1
+  
+    <<sql::binary-size(sql_len), _null::8>> = sql_with_null
+
+    Logger.info("SQL: #{inspect(sql)}")
+
+    case Regex.run(~r/shard_\d{4}/, sql) do
+      [shard_name] ->
+        Logger.info("Shard: #{shard_name}")
+
+        {:ok, backend_socket} = Instashard.Backend.Manager.get_socket(shard_name)
+
+        original_packet = <<"Q", size::32, sql_with_null::binary>>
+        :ok = :gen_tcp.send(backend_socket, original_packet)
+
+        bridge_backend_to_client(backend_socket, state.client_socket)
+
+        state
+
+      nil ->
+        state
+    end
+  end
+
+  defp bridge_backend_to_client(backend_socket, client_socket) do
+    case :gen_tcp.recv(backend_socket, 0, 5000) do
+      {:ok, packet} ->
+        Logger.info("#{inspect(packet, limit: :infinity)}")
+        :ok = :gen_tcp.send(client_socket, packet)
+        
+        prev_size = byte_size(packet) - 6
+
+        case packet do
+          <<_prev::binary-size(prev_size), "Z", 5::32, status::8>> ->
+            case status do
+              84 -> Logger.info("🏁 [物理库交卷] 状态: 'T' (In Transaction)。")
+              73 -> Logger.info("🏁 [物理库交卷] 状态: 'I' (Idle)。")
+              69 -> Logger.error("🚨 [物理库交卷] 状态: 'E' (Failed Transaction)！")
+              unknown_status -> Logger.warning("What ?: #{unknown_status}")
+            end
+            :ok
+          _ ->
+            bridge_backend_to_client(backend_socket, client_socket)
+        end
+      {:error, reason} ->
+        Logger.error("🚨 从物理库读取数据失败: #{inspect(reason)}")
+    end 
+  end
+
+end
