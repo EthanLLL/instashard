@@ -22,7 +22,7 @@ services:
       -p 5430
     shm_size: "512mb"
     volumes:
-      - /Users/luozhen/data/db0:/var/lib/postgresql/data/pgdata
+      - /Users/zhenzluo/data/db0:/var/lib/postgresql/data/pgdata
 
   # db 1, port 5431
   db1:
@@ -46,4 +46,4 @@ services:
       -p 5431
     shm_size: "512mb"
     volumes:
-      - /Users/luozhen/data/db0:/var/lib/postgresql/data/pgdata
+      - /Users/zhenzluo/data/db0:/var/lib/postgresql/data/pgdata
