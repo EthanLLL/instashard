@@ -2,6 +2,10 @@ defmodule Instashard.ProxyListener do
   use GenServer
   require Logger
 
+  # Matches a complete shard schema name. Change this when shard naming convention changes.
+  # Full-string match (\A...\z) prevents partial matches like "old_shard_0001".
+  @shard_pattern ~r/\Ashard_\d{4}\z/
+
   def start_link(opts) do
     port = Keyword.get(opts, :port, 5400)
     GenServer.start_link(__MODULE__, port, name: __MODULE__)
@@ -139,8 +143,8 @@ defmodule Instashard.ProxyListener do
 
     Logger.info("SQL: #{inspect(sql)}")
 
-    case Regex.run(~r/shard_\d{4}/, sql) do
-      [shard_name] ->
+    case extract_shard(sql) do
+      {:ok, shard_name} ->
         Logger.info("Shard: #{shard_name}")
 
         {:ok, backend_socket} = Instashard.Backend.Manager.get_socket(shard_name)
@@ -152,8 +156,31 @@ defmodule Instashard.ProxyListener do
 
         state
 
-      nil ->
+      :no_shard ->
         state
+    end
+  end
+
+  # Strip string literals to avoid false matches inside quoted values,
+  # then scan FROM/JOIN/INTO/UPDATE/TABLE clauses for schema.table references.
+  # Returns {:ok, shard_name} for the first matching schema, or :no_shard.
+  defp extract_shard(sql) do
+    stripped = Regex.replace(~r/'(?:[^'\\]|\\.)*'/, sql, "''")
+
+    # Captures the token immediately after the clause keyword, then checks
+    # whether it is a qualified reference (schema.table) whose schema matches.
+    schema_refs =
+      Regex.scan(
+        ~r/(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+("?[A-Za-z_][A-Za-z0-9_]*"?)\."?[A-Za-z_][A-Za-z0-9_]*"?/i,
+        stripped,
+        capture: :all_but_first
+      )
+      |> List.flatten()
+      |> Enum.map(&String.trim(&1, "\""))
+
+    case Enum.find(schema_refs, &Regex.match?(@shard_pattern, &1)) do
+      nil -> :no_shard
+      shard_name -> {:ok, shard_name}
     end
   end
 
