@@ -1,106 +1,72 @@
 defmodule Instashard.Backend.Manager do
+  @moduledoc """
+  Manages shard→physical-db mapping and connection replenishment.
+  Not on the hot path — Pool.checkout/checkin bypass this process entirely.
+  """
+
   use GenServer
   require Logger
+
+  # How many idle connections to maintain per shard.
+  @pool_size 5
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  def get_socket(shard) do
-    GenServer.call(__MODULE__, {:get_socket, shard})
-  end
+  @doc "Notify the manager to replenish connections for a shard."
+  def replenish(shard), do: send(__MODULE__, {:replenish, shard})
 
   @impl true
   def init(_opts) do
-    Logger.info("Init Backend Manager")
+    Instashard.Backend.Pool.init()
 
-    shard_mapping = %{
+    shard_map = %{
       "shard_0000" => :db0,
       "shard_0001" => :db1
     }
 
     db_config = %{
-      db0: %{
-        name: "db0",
-        host: ~c"127.0.0.1",
-        port: 5430,
-        username: "postgres",
-        password: "luozhenzuishuai",
-        database: "my_cluster"
-      },
-      db1: %{
-        name: "db1",
-        host: ~c"127.0.0.1",
-        port: 5431,
-        username: "postgres",
-        password: "luozhenzuishuai",
-        database: "my_cluster"
-      }
+      db0: %{host: "127.0.0.1", port: 5430, username: "postgres", password: "luozhenzuishuai", database: "my_cluster"},
+      db1: %{host: "127.0.0.1", port: 5431, username: "postgres", password: "luozhenzuishuai", database: "my_cluster"}
     }
 
-    sockets = %{
-      db0: init_connection(db_config.db0),
-      db1: init_connection(db_config.db1)
-    }
-
-    {:ok, %{shard_mapping: shard_mapping, db_config: db_config, sockets: sockets}}
+    state = %{shard_map: shard_map, db_config: db_config}
+    send(self(), :fill_pool)
+    {:ok, state}
   end
-
-  defp init_connection(db) do
-    {:ok, socket} = :gen_tcp.connect(db.host, db.port, [:binary, active: false])
-
-    payload = <<
-      # Protocol version (3.0)
-      0,
-      3,
-      0,
-      0,
-      "user",
-      0,
-      db.username::binary,
-      0,
-      "database",
-      0,
-      db.database::binary,
-      0,
-      0
-    >>
-
-    packet_size = byte_size(payload) + 4
-
-    startup_packet = <<packet_size::32, payload::binary>>
-
-    :ok = :gen_tcp.send(socket, startup_packet)
-
-    case :gen_tcp.recv(socket, 0, 2000) do
-      {:ok, _trash} ->
-        Logger.info("#{db.name} connected")
-        socket
-
-      {error, :timeout} ->
-        Logger.error("#{error}")
-    end
-  end
-
-  # defp contains_ready_for_query?(<<_::binary, "Z", 5::32, status::8, _::binary>>)
-  #      when status in [73, 84, 69] do
-  #   # 状态码：73='I', 84='T', 69='E'
-  #   # 只要命中了这个结构的切片，直接返回 true
-  #   true
-  # end
-  #
-  # defp contains_ready_for_query?(_), do: false
 
   @impl true
-  def handle_call({:get_socket, shard}, _from, state) do
-    case Map.get(state.shard_mapping, shard) do
-      nil ->
-        Logger.error("No shard mapping: #{shard}")
-        {:reply, {:error, :unmapped_shard}, state}
+  def handle_info(:fill_pool, state) do
+    Enum.each(state.shard_map, fn {shard, _db_key} ->
+      fill_shard(shard, state)
+    end)
+    {:noreply, state}
+  end
 
-      db_key ->
-        socket = Map.get(state.sockets, db_key)
-        {:reply, {:ok, socket}, state}
+  def handle_info({:replenish, shard}, state) do
+    fill_shard(shard, state)
+    {:noreply, state}
+  end
+
+  defp fill_shard(shard, state) do
+    current = Instashard.Backend.Pool.count(shard)
+    needed = @pool_size - current
+
+    if needed > 0 do
+      db_key = Map.fetch!(state.shard_map, shard)
+      cfg = Map.fetch!(state.db_config, db_key)
+
+      Enum.each(1..needed, fn _ ->
+        case Instashard.Backend.Connection.connect(cfg) do
+          {:ok, socket} ->
+            Instashard.Backend.Pool.checkin(shard, socket)
+            Logger.debug("[Manager] Connected socket for #{shard}")
+
+          {:error, reason} ->
+            Logger.error("[Manager] Failed to connect for #{shard}: #{inspect(reason)}")
+        end
+      end)
     end
   end
 end

@@ -11,12 +11,10 @@ defmodule Instashard.Application do
       InstashardWeb.Telemetry,
       {DNSCluster, query: Application.get_env(:instashard, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Instashard.PubSub},
-      # Start a worker by calling: Instashard.Worker.start_link(arg)
-      # {Instashard.Worker, arg},
-      # Start to serve requests, typically the last entry
       InstashardWeb.Endpoint,
       Instashard.Backend.Manager,
-      {Instashard.ProxyListener, port: 5400}
+      Instashard.Proxy.SessionSupervisor,
+      {Instashard.Proxy.Listener, port: 5400}
     ]
 
     # See https://hexdocs.pm/elixir/Supervisor.html

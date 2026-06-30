@@ -16,9 +16,7 @@ The core ideas, as described in their [2012 engineering blog post](https://insta
 
 3. **Physical cluster indirection** — logical shards are mapped to physical databases by the proxy. Moving data from one physical node to another is a configuration change, not a schema migration.
 
-4. **Transparent wire-protocol proxy** — application code talks standard PostgreSQL. The proxy intercepts the connection, inspects the SQL, extracts the target shard, and forwards the query to the correct physical cluster. All traffic flows through the proxy; clients never connect directly to a physical database. This is what makes zero-downtime shard migration possible.
-
-This project implements that design end-to-end in Elixir.
+4. **Transparent wire-protocol proxy** — application code talks standard PostgreSQL. The proxy intercepts the connection, inspects the SQL, extracts the target shard, and forwards the query to the correct physical cluster. All traffic flows through the proxy; clients never connect directly to a physical database.
 
 ---
 
@@ -27,9 +25,9 @@ This project implements that design end-to-end in Elixir.
 Every ID generated in this system is a 64-bit signed integer with three packed fields:
 
 ```
- 63                22 21        10 9         0
+ 63                23 22        10 9         0
  ┌─────────────────────┬───────────┬──────────┐
- │  41-bit timestamp   │ 12-bit    │ 10-bit   │
+ │  41-bit timestamp   │ 13-bit    │ 10-bit   │
  │  (ms since epoch)   │ shard ID  │ sequence │
  └─────────────────────┴───────────┴──────────┘
 ```
@@ -37,35 +35,16 @@ Every ID generated in this system is a 64-bit signed integer with three packed f
 | Field     | Bits | Range     | Description                                             |
 | --------- | ---- | --------- | ------------------------------------------------------- |
 | Timestamp | 41   | ~69 years | Milliseconds since 2026-01-01 00:00:00 UTC              |
-| Shard ID  | 12   | 0 – 4095  | Logical shard number, matches the schema (`shard_XXXX`) |
+| Shard ID  | 13   | 0 – 8191  | Logical shard number, matches the schema (`shard_XXXX`). Currently 4096 shards in use (0–4095), capacity reserved up to 8191. |
 | Sequence  | 10   | 0 – 1023  | Per-shard sequence, supports 1024 IDs/ms per shard      |
-
-**Generation** — PostgreSQL function installed in each shard schema:
-
-```sql
-CREATE OR REPLACE FUNCTION generate_snowflake_id(schema_name TEXT)
-RETURNS BIGINT AS $$
-DECLARE
-  epoch        BIGINT := 1767225600000;  -- 2026-01-01T00:00:00Z in ms
-  ts_delta     BIGINT;
-  shard_id     BIGINT;
-  seq          BIGINT;
-BEGIN
-  ts_delta := EXTRACT(EPOCH FROM clock_timestamp()) * 1000 - epoch;
-  shard_id  := CAST(SUBSTRING(schema_name FROM 7) AS BIGINT);
-  seq       := nextval(schema_name || '.id_sequence') % 1024;
-  RETURN (ts_delta << 23) | (shard_id << 10) | seq;
-END;
-$$ LANGUAGE plpgsql;
-```
 
 **Extraction** — any client can recover the shard from an ID with two operations:
 
 ```
-shard_id = (id >> 10) & 0xFFF
+shard_id = (id >> 10) & 0x1FFF
 ```
 
-No lookup, no network call. This is the property that makes routing stateless.
+No lookup, no network call.
 
 ---
 
@@ -82,25 +61,15 @@ No lookup, no network call. This is the property that makes routing stateless.
 ┌─────────────────────────────────────────────────────────────┐
 │                    InstaShard Proxy                         │
 │                                                             │
-│  1. Accept TCP connection                                   │
-│  2. Handle PostgreSQL startup handshake                     │
-│  3. For each query:                                         │
-│     a. Extract shard name via regex (shard_\d{4})           │
-│     b. Lookup physical cluster in shard mapping             │
-│     c. Forward packet to backend socket                     │
-│     d. Bridge response back to client                       │
+│  Proxy.Listener          accepts TCP connections            │
+│  Proxy.SessionSupervisor DynamicSupervisor for sessions     │
+│  Proxy.ClientSession     one GenServer per client conn      │
+│  Proxy.ShardRouter       extracts shard from SQL            │
+│  Proxy.PgProtocol        wire protocol helpers              │
 │                                                             │
-│  Backend.Manager (GenServer)                                │
-│  ┌──────────────────────────────────────────┐              │
-│  │  shard_mapping:                          │              │
-│  │    "shard_0000" → :db0                   │              │
-│  │    "shard_0001" → :db1                   │              │
-│  │    ...          → ...                    │              │
-│  │                                          │              │
-│  │  sockets:                                │              │
-│  │    db0 → persistent TCP socket           │              │
-│  │    db1 → persistent TCP socket           │              │
-│  └──────────────────────────────────────────┘              │
+│  Backend.Pool            ETS connection pool (lock-free)    │
+│  Backend.Manager         connection lifecycle + replenish   │
+│  Backend.Connection      TCP connect + MD5/SCRAM-SHA-256    │
 └──────────┬──────────────────────────┬───────────────────────┘
            │                          │
            ▼                          ▼
@@ -114,145 +83,129 @@ No lookup, no network call. This is the property that makes routing stateless.
 └──────────────────┘        └──────────────────┘
 ```
 
-### Components
+---
 
-**`ProxyListener`** — TCP server on port 5400. Implements the PostgreSQL wire protocol at the message level:
+## Components
 
-- Handles SSL negotiation (responds `N` — not supported)
-- Handles the startup message (version 3.0), extracts database/user params, and sends `AuthenticationOK` + `ReadyForQuery`
-- Handles `Q` (simple query) messages: extracts the target shard name from the SQL text, retrieves the pre-established backend socket from the manager, forwards the raw packet, and bridges the response stream back to the client
-- Tracks transaction state (`I` / `T` / `E`) from `ReadyForQuery` (`Z`) markers
+**`Proxy.Listener`** — TCP server on port 5400. Accepts connections and hands each socket to a supervised `ClientSession`.
 
-**`Backend.Manager`** — GenServer that owns all physical database connections:
+**`Proxy.ClientSession`** — One GenServer per client connection. Drives the session state machine (handshake → idle ↔ transaction) and handles both Simple Query and Extended Protocol.
 
-- Establishes persistent TCP connections to each physical cluster at startup by performing a full PostgreSQL startup handshake
-- Maintains a `shard_mapping` table: logical shard name → physical cluster key
-- Maintains a `sockets` table: cluster key → live TCP socket
-- Answers `get_socket(shard_name)` calls from the proxy in a single map lookup — no per-query connection overhead
+**`Proxy.ShardRouter`** — Extracts the target shard name from SQL. Strips string literals first to avoid false matches, then scans `FROM`/`JOIN`/`INTO`/`UPDATE`/`TABLE` clauses for `schema.table` qualified identifiers matching `@shard_pattern`.
 
-**`distributed-pg.sql`** — initialization script that creates all 4096 schemas on each physical node, one sequence per schema, a `users` example table, and the `generate_snowflake_id` function.
+**`Proxy.PgProtocol`** — Wire protocol helpers: startup param parsing, ReadyForQuery status extraction, Parse message SQL extraction.
+
+**`Backend.Pool`** — ETS-backed connection pool. Checkout and checkin are lock-free: `select` finds a candidate entry, `ets:take` atomically removes it. The Manager GenServer is off the hot path entirely.
+
+**`Backend.Manager`** — Owns the shard→physical-db mapping. Initializes the pool at startup and replenishes connections on demand. Not involved in query routing.
+
+**`Backend.Connection`** — Establishes a raw TCP connection to PostgreSQL and performs the full authentication handshake, supporting both MD5 and SCRAM-SHA-256.
 
 ---
 
-## Query Routing Flow
+## Query Routing
+
+### Simple Query
 
 ```
-1. Client sends:
-   SELECT * FROM shard_0211.users WHERE id = 864691128455135235;
-
-2. Proxy extracts "shard_0211" via ~r/shard_\d{4}/
-
-3. Manager.get_socket("shard_0211")
-   → shard_0211 mapped to :db0
-   → return socket connected to 127.0.0.1:5430
-
-4. Proxy forwards raw Q packet to db0
-
-5. db0 executes query on schema shard_0211
-
-6. Proxy bridges response packets back to client
-   until ReadyForQuery (Z) is received
+Client:  Q("SELECT * FROM shard_0000.users WHERE id = $1")
+Proxy:   extract_shard → "shard_0000"
+         Pool.checkout("shard_0000") → socket
+         forward packet to backend
+         forward response to client
+         Pool.checkin("shard_0000", socket)
 ```
 
-The ID structure means any layer can determine which shard owns a row using two operations — no lookup, no network call:
+### Extended Protocol
 
-```python
-shard_id = (id >> 10) & 0xFFF   # e.g. 864691128455135235 → 211
+```
+Client:  P("SELECT * FROM shard_0000.users WHERE id = $1")
+Proxy:   extract SQL from Parse message
+         extract_shard → "shard_0000"
+         Pool.checkout → ext_socket
+         forward ParseComplete to client
+
+Client:  B(params) → E → S
+Proxy:   forward Bind/Execute on ext_socket
+         forward responses to client
+         on Sync: forward ReadyForQuery, Pool.checkin
 ```
 
-Clients compute this to construct shard-qualified SQL (`SELECT * FROM shard_0211.users ...`). What they don't need to know is which physical database shard_0211 lives on — that mapping is owned entirely by the proxy. When a shard is migrated to a new physical node, the SQL the client writes doesn't change at all.
+### Transaction (Lazy Checkout)
+
+```
+Client:  BEGIN
+Proxy:   fake CommandComplete("BEGIN") + ReadyForQuery('T')
+         buffer [BEGIN packet]
+
+Client:  SET search_path = ...        ← no shard yet
+Proxy:   fake ReadyForQuery('T')
+         buffer [BEGIN, SET packets]
+
+Client:  INSERT INTO shard_0000.users ...
+Proxy:   extract_shard → "shard_0000"
+         Pool.checkout → tx_socket
+         flush buffer to backend (drain + discard responses)
+         forward INSERT response to client
+         tx_socket locked for this session
+
+Client:  COMMIT
+Proxy:   forward on tx_socket
+         on ReadyForQuery('I'): Pool.checkin, clear tx state
+```
+
+The shard is unknown at `BEGIN` time — checkout is deferred until the first shard-bearing statement. Buffered packets (BEGIN, SET, SAVEPOINT) are replayed to the backend before the first real query, then responses are drained and discarded since the client already received fake responses for them.
 
 ---
 
-## Shard → Cluster Mapping
+## Connection Pool
 
-The `Backend.Manager` holds the authoritative mapping. Currently two physical clusters split the 4096 logical shards:
+The pool uses a single ETS `ordered_set` table with key `{shard_name, ref}`:
+
+```
+checkout:
+  select → find a ref for this shard
+  ets:take({shard, ref}) → atomic remove
+  if taken by another process: retry
+
+checkin:
+  ets:insert({{shard, make_ref()}, socket})
+```
+
+`ets:take/2` is guaranteed atomic and isolated (OTP 18+). Multiple processes can checkout concurrently with no serialization bottleneck — the ETS bucket-level locking is the only contention point.
+
+The Manager GenServer handles only the cold path: initializing connections at startup and replenishing the pool when `replenish/1` is called after a checkout.
+
+---
+
+## Shard Pattern
+
+The shard name pattern is defined as a module attribute in `ShardRouter`:
 
 ```elixir
-shard_mapping = %{
-  "shard_0000" => :db0,
-  "shard_0001" => :db1,
-  # ... all 4096 entries in production, loaded from config
-}
+@shard_pattern ~r/\Ashard_\d{4}\z/
 ```
 
-Moving a shard from one physical cluster to another — e.g., after migrating its data — is a one-line config change. The shard ID embedded in every existing row never changes.
-
-### Scaling Path
-
-| Physical clusters | Shards each | Expansion strategy                        |
-| ----------------- | ----------- | ----------------------------------------- |
-| 2                 | 2048        | Current dev setup                         |
-| 4                 | 1024        | Add db2/db3, remap even/odd subsets       |
-| N                 | 4096 / N    | `shard_id mod N` or explicit range config |
-| 4096              | 1           | Maximum granularity — one schema per node |
-
-Because logical shard IDs are fixed in the ID bit layout forever, resharding never invalidates existing data. Only the proxy mapping changes.
+Full-string anchoring (`\A...\z`) prevents partial matches. This will become a per-logical-db configuration once the logical→physical DB mapping layer is introduced.
 
 ---
 
-## Roadmap
-
-### Live Shard Migration (Zero Downtime)
-
-The proxy architecture is deliberately chosen to support live data migration without any application downtime. The planned migration flow is:
+## Project Structure
 
 ```
-1. Operator triggers migration: shard_0042 → db0 to db2
-
-2. Proxy enables PostgreSQL logical replication on db0,
-   subscribing only to the target shard's schema.
-   (Physical replication of one schema, not the whole instance.)
-
-3. db2 catches up. The proxy monitors replication lag continuously.
-
-4. When lag approaches zero, the proxy broadcasts a global pause
-   to all connection processes handling shard_0042 traffic.
-   Connections are held — clients see a brief stall, not an error.
-
-5. Proxy waits for the final replication flush, then atomically
-   updates the shard mapping: shard_0042 → db2.
-
-6. Connections are released. All subsequent queries for shard_0042
-   are routed to db2. Migration complete.
+lib/instashard/
+├── application.ex
+├── backend/
+│   ├── connection.ex   # TCP connect + MD5/SCRAM-SHA-256 auth
+│   ├── pool.ex         # ETS connection pool, lock-free checkout/checkin
+│   └── manager.ex      # Shard mapping + connection replenishment
+└── proxy/
+    ├── listener.ex          # TCP accept loop
+    ├── session_supervisor.ex # DynamicSupervisor for client sessions
+    ├── client_session.ex    # Per-connection GenServer, session state machine
+    ├── shard_router.ex      # SQL → shard extraction
+    └── pg_protocol.ex       # Wire protocol helpers
 ```
-
-Because every client connection is owned by a proxy process (an Elixir lightweight process), the "hold all connections" step is a targeted broadcast across those processes — no kernel-level lock, no application change required.
-
-### Distributed Proxy with Mnesia
-
-As the proxy cluster grows beyond a single node, the shard mapping must be consistent across all proxy instances. The plan is to store the mapping in [Mnesia](https://www.erlang.org/doc/man/mnesia.html) — Erlang/OTP's built-in distributed database:
-
-- **Read-heavy, write-rarely** — the mapping changes only during shard migrations, which are infrequent. Mnesia's in-memory table mode gives sub-microsecond reads on every node with no network hop.
-- **Strong consistency** — Mnesia uses a synchronous transaction protocol. During a migration cutover, the mapping update is committed as a Mnesia transaction; all proxy nodes see the new mapping atomically before any connection is released.
-- **No external coordinator** — the Mnesia cluster is the proxy cluster. Adding a new proxy node joins the Erlang cluster and immediately has a full replica of the mapping. No Redis, no ZooKeeper, no etcd.
-
-```
-┌──────────────────────────────────────────────────────────┐
-│                  InstaShard Proxy Cluster                │
-│                                                          │
-│  node1 ──┐                                               │
-│  node2 ──┼── Mnesia distributed table (shard_mapping)   │
-│  node3 ──┘   strong-consistent, replicated, in-memory   │
-│                                                          │
-│  During migration cutover:                               │
-│    Mnesia.transaction(fn -> update mapping end)          │
-│    → committed on all nodes before connections resume    │
-└──────────────────────────────────────────────────────────┘
-```
-
-### Planned Features Summary
-
-| Feature                             | Status  | Notes                                  |
-| ----------------------------------- | ------- | -------------------------------------- |
-| PostgreSQL wire protocol proxy      | Done    | Simple query, startup, auth            |
-| Snowflake ID generation in PG       | Done    | Per-shard sequence, 1024 IDs/ms        |
-| Static shard→cluster mapping        | Done    | In-memory GenServer                    |
-| Logical replication-based migration | Planned | Schema-level, not instance-level       |
-| Connection hold + atomic cutover    | Planned | Broadcast to proxy processes           |
-| Mnesia-backed distributed mapping   | Planned | Strong consistency, no external deps   |
-| Multi-node proxy cluster            | Planned | Erlang clustering + Mnesia replication |
-| Migration progress telemetry        | Planned | Replication lag monitoring via Phoenix |
 
 ---
 
@@ -270,16 +223,12 @@ cd db
 docker compose up -d
 ```
 
-Two PostgreSQL instances start:
-
 | Instance | Port |
 | -------- | ---- |
 | db0      | 5430 |
 | db1      | 5431 |
 
 ### 2. Initialize the schemas
-
-Run `distributed-pg.sql` on both instances to create the 4096 schemas, sequences, and the ID generation function:
 
 ```bash
 psql -h 127.0.0.1 -p 5430 -U postgres -d my_cluster -f db/distributed-pg.sql
@@ -290,10 +239,8 @@ psql -h 127.0.0.1 -p 5431 -U postgres -d my_cluster -f db/distributed-pg.sql
 
 ```bash
 mix deps.get
-mix run --no-halt
+iex -S mix phx.server
 ```
-
-The proxy listens on port 5400. The Phoenix web endpoint (telemetry/dashboard) runs on port 4000.
 
 ### 4. Connect through the proxy
 
@@ -301,58 +248,56 @@ The proxy listens on port 5400. The Phoenix web endpoint (telemetry/dashboard) r
 psql -h 127.0.0.1 -p 5400 -U postgres -d my_cluster
 ```
 
-Then issue shard-qualified queries:
-
 ```sql
--- Insert; ID generated automatically by the snowflake function
-INSERT INTO shard_0042.users (username, email)
-VALUES ('alice', 'alice@example.com')
-RETURNING id;
+-- Simple query
+SELECT * FROM shard_0000.users;
 
--- The returned id encodes shard 42: (id >> 10) & 0xFFF = 42
+-- Transaction
+BEGIN;
+INSERT INTO shard_0000.users (username, email) VALUES ('alice', 'alice@example.com');
+COMMIT;
 
-SELECT * FROM shard_0042.users WHERE id = <returned_id>;
+-- Extended protocol (psql 17+, no semicolon)
+SELECT * FROM shard_0000.users WHERE id = $1
+\bind 1
+\g
 ```
 
 ---
 
-## Project Structure
+## Roadmap
 
-```
-instashard/
-├── lib/instashard/
-│   ├── application.ex          # OTP supervision tree
-│   ├── proxy_listener.ex       # PostgreSQL wire protocol proxy (TCP server)
-│   └── backend/
-│       └── manager.ex          # Physical DB connections + shard mapping
-├── db/
-│   ├── docker-compose.yml      # Two-node PostgreSQL cluster
-│   └── distributed-pg.sql      # 4096 schema init + Snowflake ID function
-└── config/
-    ├── config.exs
-    ├── dev.exs
-    └── runtime.exs
-```
+| Feature                             | Status      | Notes                                        |
+| ----------------------------------- | ----------- | -------------------------------------------- |
+| PostgreSQL wire protocol proxy      | Done        | Simple Query + Extended Protocol             |
+| MD5 / SCRAM-SHA-256 authentication  | Done        | Full handshake per backend connection        |
+| ETS lock-free connection pool       | Done        | ets:take atomic checkout, no GenServer bottleneck |
+| Per-shard transactions              | Done        | Lazy checkout, buffer flush, fake responses  |
+| Snowflake ID generation in PG       | Done        | Per-shard sequence, 1024 IDs/ms              |
+| Configurable shard pattern          | Planned     | Per logical-db config                        |
+| Logical→physical DB mapping layer   | Planned     | Decouple shard pattern from routing config   |
+| Prepared statement rewrite          | Planned     | Rewrite named statements to anonymous to handle pool socket switching |
+| Extended protocol transactions      | Done        | Parse/Bind/Execute/Sync inside BEGIN..COMMIT |
+| Live shard migration                | Planned     | Logical replication + atomic cutover         |
+| Mnesia-backed distributed mapping   | Planned     | Multi-node proxy cluster                     |
 
 ---
 
 ## Design Tradeoffs
 
-**Why 4096 shards, not fewer?**
-The logical shard count is fixed permanently — it's baked into the ID bit layout. Choosing 4096 gives a ceiling of 4096 physical nodes (practically unreachable), and lets you start with 2 nodes and grow without touching any data.
+**Why 8192 shard capacity?**
+The logical shard count is fixed permanently — it's baked into the ID bit layout. The 13-bit shard field gives a ceiling of 8192 physical nodes (practically unreachable). Currently 4096 schemas (0–4095) are provisioned, leaving the upper half as headroom. Either way, you start with 2 physical nodes and grow without touching any existing data or IDs.
 
 **Why embed shard in the ID rather than hashing the key?**
 Embedding shard ID makes routing O(1) bit arithmetic with zero external state. A hash is also O(1), but consistent hashing across a changing cluster size still requires a routing table. With a fixed shard count and explicit shard-to-cluster config, the contract is clearer and migration is explicit and auditable.
 
 **Why a proxy instead of a client-side sharding library?**
-Two independent reasons, both pointing to the same answer:
+PostgreSQL connections are OS processes — each client connection forks a `postgres` backend process. At scale, letting application instances open direct connections exhausts the connection limit fast. A proxy pools connections to the physical databases regardless of how many clients connect.
 
-First, PostgreSQL connections are OS processes — each client connection forks a `postgres` backend process. At any meaningful scale, letting application instances open direct connections to physical databases exhausts the connection limit fast. A connection-pooling proxy (analogous to PgBouncer) is standard practice regardless of sharding; InstaShard builds sharding routing into the same layer.
-
-Second, keeping all connections inside the proxy is what makes zero-downtime shard migration possible. The proxy can hold connections, monitor replication lag, and atomically update the shard mapping in one coordinated step. None of that is achievable if clients route themselves directly to physical databases.
+Keeping all connections inside the proxy is also what makes zero-downtime shard migration possible. The proxy can hold connections, monitor replication lag, and atomically update the shard mapping. None of that is achievable if clients route themselves.
 
 **Why Elixir?**
-The proxy is primarily I/O concurrency: accept connections, forward bytes, bridge responses. Elixir's lightweight processes and OTP supervision make it straightforward to handle thousands of concurrent connections with per-connection isolated state and automatic crash recovery.
+The proxy is primarily I/O concurrency: accept connections, forward bytes, bridge responses. Elixir's lightweight processes and OTP supervision make it straightforward to handle tens of thousands of concurrent connections with per-connection isolated state and automatic crash recovery.
 
 ---
 
@@ -360,4 +305,5 @@ The proxy is primarily I/O concurrency: accept connections, forward bytes, bridg
 
 - [Sharding & IDs at Instagram (2012)](https://instagram-engineering.tumblr.com/post/10853187575/sharding-ids-at-instagram)
 - [Twitter Snowflake](https://github.com/twitter-archive/snowflake)
+- [PostgreSQL Frontend/Backend Protocol](https://www.postgresql.org/docs/current/protocol.html)
 - [PostgreSQL Schemas](https://www.postgresql.org/docs/current/ddl-schemas.html)

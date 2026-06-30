@@ -23,14 +23,14 @@ DECLARE
     now_millis bigint;
     shard_id int;
 BEGIN
-    shard_id := substring(schema_name from 'shard_([0-9]{4})')::int;
+    shard_id := substring(schema_name from 'shard_([0-9]+)')::int;
 
     SELECT floor(extract(epoch FROM clock_timestamp()) * 1000) INTO now_millis;
 
     EXECUTE format('SELECT nextval(%L) %% 1024', schema_name || '.id_sequence') INTO seq_id;
 
     result := (now_millis - our_epoch) << 23;
-    result := result | (shard_id << 10);
+    result := result | (shard_id << 10);  -- shard_id occupies bits 10–22 (13 bits, 0–8191)
     result := result | seq_id;
 END;
 $$ LANGUAGE plpgsql;
@@ -45,10 +45,9 @@ BEGIN
                 username varchar(50) NOT NULL,
                 email varchar(100),
                 created_at timestamp DEFAULT now()
-            );', 
-            to_char(i, 'FM0000'), 
-            'shard_' || to_char(i, 'FM0000'), 
-            to_char(i, 'FM0000')
+            );',
+            to_char(i, 'FM0000'),
+            'shard_' || to_char(i, 'FM0000')
         );
     END LOOP;
 END $$;

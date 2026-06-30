@@ -14,10 +14,7 @@ config :instashard,
 config :instashard, InstashardWeb.Endpoint,
   url: [host: "localhost"],
   adapter: Bandit.PhoenixAdapter,
-  render_errors: [
-    formats: [html: InstashardWeb.ErrorHTML, json: InstashardWeb.ErrorJSON],
-    layout: false
-  ],
+  render_errors: [formats: [json: InstashardWeb.ErrorJSON], layout: false],
   pubsub_server: Instashard.PubSub,
   live_view: [signing_salt: "mBUNq3cv"]
 
