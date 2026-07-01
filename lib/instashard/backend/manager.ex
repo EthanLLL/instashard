@@ -20,6 +20,7 @@ defmodule Instashard.Backend.Manager do
   @impl true
   def init(_opts) do
     Instashard.Backend.Pool.init()
+    Instashard.Backend.StmtCache.init()
 
     shard_map = %{
       "shard_0000" => :db0,
@@ -60,7 +61,8 @@ defmodule Instashard.Backend.Manager do
       Enum.each(1..needed, fn _ ->
         case Instashard.Backend.Connection.connect(cfg) do
           {:ok, socket} ->
-            Instashard.Backend.Pool.checkin(shard, socket)
+            entry = Instashard.Backend.Pool.new_entry(socket)
+            Instashard.Backend.Pool.checkin(shard, entry)
             Logger.debug("[Manager] Connected socket for #{shard}")
 
           {:error, reason} ->
