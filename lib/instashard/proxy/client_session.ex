@@ -38,6 +38,10 @@ defmodule Instashard.Proxy.ClientSession do
     # client_stmt_name → {internal_name, shard}
     # shard is needed when Bind arrives without a preceding Parse in this pipeline
     stmt_map: %{},
+    # When a checkout returns {:error, :migrating}, we hold packets here.
+    # All messages arriving while held_shard != nil are buffered and replayed on resume.
+    held_pipeline: [],
+    held_shard: nil,
     # How many Parse messages were skipped (stmt already on socket).
     # We inject this many fake ParseComplete packets before forwarding Sync response.
     pending_fake_parses: 0,
@@ -57,11 +61,33 @@ defmodule Instashard.Proxy.ClientSession do
     {:ok, %__MODULE__{client_socket: client_socket}}
   end
 
+  @doc "Called by Migration when a shard's gate reopens after cutover."
+  def migration_resumed(pid, shard) do
+    send(pid, {:migration_resumed, shard})
+  end
+
   # ── TCP events ────────────────────────────────────────────────────────
 
   @impl true
   def handle_info({:tcp, _sock, data}, state) do
-    {:noreply, dispatch_all(data, state)}
+    if state.held_shard != nil do
+      # A shard is held — buffer raw bytes, replay whole pipeline on resume
+      {:noreply, %{state | held_pipeline: state.held_pipeline ++ [data]}}
+    else
+      {:noreply, dispatch_all(data, state)}
+    end
+  end
+
+  def handle_info({:migration_resumed, shard}, state) do
+    if state.held_shard == shard && state.held_pipeline != [] do
+      pipeline = state.held_pipeline
+      Logger.info("[Session] Migration resumed for #{shard}, replaying #{length(pipeline)} buffered segment(s)")
+      new_state = %{state | held_pipeline: [], held_shard: nil}
+      final = Enum.reduce(pipeline, new_state, fn data, s -> dispatch_all(data, s) end)
+      {:noreply, final}
+    else
+      {:noreply, %{state | held_pipeline: [], held_shard: nil}}
+    end
   end
 
   def handle_info({:tcp_closed, _}, state) do
@@ -78,6 +104,7 @@ defmodule Instashard.Proxy.ClientSession do
 
   # ── Message splitter ──────────────────────────────────────────────────
   # One TCP segment can carry multiple PG messages. Process each in order.
+  # While a shard is held (migrating), buffer all raw bytes and replay on resume.
 
   # SSL request (no type byte, fixed 8 bytes)
   defp dispatch_all(<<0, 0, 0, 8, 4, 210, 22, 47, rest::binary>>, state) do
@@ -87,7 +114,7 @@ defmodule Instashard.Proxy.ClientSession do
 
   # Startup message (no type byte, length-prefixed)
   defp dispatch_all(<<len::32, 0, 3, 0, 0, _::binary>> = data, state) do
-    msg_len = len  # len includes the 4-byte length field
+    msg_len = len
     <<msg::binary-size(msg_len), rest::binary>> = data
     state = handle_packet(msg, state)
     dispatch_all(rest, state)
@@ -95,14 +122,20 @@ defmodule Instashard.Proxy.ClientSession do
 
   # Normal message: type(1) + len(4, includes itself) + body(len-4)
   defp dispatch_all(<<type, len::32, rest::binary>>, state) when len >= 4 do
-    body_len = len - 4
-    case rest do
-      <<body::binary-size(body_len), remaining::binary>> ->
-        msg = <<type, len::32, body::binary>>
-        state = handle_packet(msg, state)
-        dispatch_all(remaining, state)
-      _ ->
-        handle_packet(<<type, len::32, rest::binary>>, state)
+    # If a previous message in this segment triggered a hold, buffer the remainder.
+    if state.held_shard != nil do
+      <<msg_and_rest::binary>> = <<type, len::32, rest::binary>>
+      %{state | held_pipeline: state.held_pipeline ++ [msg_and_rest]}
+    else
+      body_len = len - 4
+      case rest do
+        <<body::binary-size(body_len), remaining::binary>> ->
+          msg = <<type, len::32, body::binary>>
+          state = handle_packet(msg, state)
+          dispatch_all(remaining, state)
+        _ ->
+          handle_packet(<<type, len::32, rest::binary>>, state)
+      end
     end
   end
 
@@ -168,13 +201,12 @@ defmodule Instashard.Proxy.ClientSession do
       state.tx_buffer != [] ->
         case ShardRouter.extract_shard(sql) do
           {:ok, shard} ->
-            new_state = flush_tx_buffer(shard, state)
-            if new_state.tx_socket != nil do
-              :ok = :gen_tcp.send(new_state.tx_socket, raw)
-              {:ok, _} = forward_response(new_state.tx_socket, state.client_socket)
-              new_state
-            else
-              new_state
+            case flush_tx_buffer(shard, raw, state) do
+              {:migrating, new_state} -> new_state
+              {:ok, new_state} ->
+                :ok = :gen_tcp.send(new_state.tx_socket, raw)
+                {:ok, _} = forward_response(new_state.tx_socket, state.client_socket)
+                new_state
             end
 
           :no_shard ->
@@ -184,7 +216,6 @@ defmodule Instashard.Proxy.ClientSession do
 
       true ->
         route_simple_query(sql, raw, state)
-        state
     end
   end
 
@@ -197,13 +228,26 @@ defmodule Instashard.Proxy.ClientSession do
             :ok = :gen_tcp.send(socket, raw)
             forward_response(socket, state.client_socket)
             Pool.checkin(shard, entry)
+            state
+          {:error, :migrating} ->
+            hold_packet(raw, shard, state)
           {:error, :empty} ->
             Logger.error("[Session] Pool empty for #{shard}")
             send_error(state.client_socket, "pool exhausted for shard #{shard}")
+            state
         end
       :no_shard ->
         send_error(state.client_socket, "cannot route: no shard reference in query")
+        state
     end
+  end
+
+  # Hold a packet while the shard's migration gate is closed.
+  # Subsequent TCP data is buffered in held_pipeline until resume.
+  defp hold_packet(raw, shard, state) do
+    Logger.info("[Session] Shard #{shard} is migrating, holding pipeline")
+    Instashard.Backend.MigrationGate.register_waiting(shard, self())
+    %{state | held_pipeline: [raw], held_shard: shard}
   end
 
   defp forward_on_tx_socket(sql, raw, state) do
@@ -231,13 +275,13 @@ defmodule Instashard.Proxy.ClientSession do
       state.tx_buffer != [] ->
         case ShardRouter.extract_shard(sql) do
           {:ok, shard} ->
-            new_state = flush_tx_buffer(shard, state)
-            if new_state.tx_socket != nil do
-              {new_stmt_map, new_entry, action} = send_parse(raw, sql, shard, new_state.tx_socket, new_state.tx_entry, new_state.stmt_map)
-              fakes = new_state.pending_fake_parses + if(action == :skipped, do: 1, else: 0)
-              %{new_state | stmt_map: new_stmt_map, tx_entry: new_entry, pending_fake_parses: fakes}
-            else
-              new_state
+            case flush_tx_buffer(shard, raw, state) do
+              {:migrating, new_state} ->
+                new_state
+              {:ok, new_state} ->
+                {new_stmt_map, new_entry, action} = send_parse(raw, sql, shard, new_state.tx_socket, new_state.tx_entry, new_state.stmt_map)
+                fakes = new_state.pending_fake_parses + if(action == :skipped, do: 1, else: 0)
+                %{new_state | stmt_map: new_stmt_map, tx_entry: new_entry, pending_fake_parses: fakes}
             end
 
           :no_shard ->
@@ -262,6 +306,8 @@ defmodule Instashard.Proxy.ClientSession do
                 %{state | ext_socket: socket, ext_shard: shard,
                           ext_entry: new_entry, stmt_map: new_stmt_map,
                           pending_fake_parses: fakes}
+              {:error, :migrating} ->
+                hold_packet(raw, shard, state)
               {:error, :empty} ->
                 Logger.error("[Session] Pool empty for #{shard}")
                 send_error(state.client_socket, "pool exhausted for shard #{shard}")
@@ -338,6 +384,8 @@ defmodule Instashard.Proxy.ClientSession do
                 %{state | ext_socket: socket, ext_shard: shard, ext_entry: new_entry,
                           pending_drain_parses: drains}
 
+              {:error, :migrating} ->
+                hold_packet(raw, shard, state)
               {:error, :empty} ->
                 Logger.error("[Session] Pool empty for #{shard} on Bind")
                 send_error(state.client_socket, "pool exhausted for shard #{shard}")
@@ -501,7 +549,9 @@ defmodule Instashard.Proxy.ClientSession do
 
   # ── TX buffer flush ───────────────────────────────────────────────────
 
-  defp flush_tx_buffer(shard, state) do
+  # Returns {:ok, new_state} or {:migrating, new_state}.
+  # raw is the triggering packet — held if migrating so it can be replayed on resume.
+  defp flush_tx_buffer(shard, raw, state) do
     case Pool.checkout(shard) do
       {:ok, entry} ->
         {socket, _pc, _ss} = entry
@@ -509,11 +559,16 @@ defmodule Instashard.Proxy.ClientSession do
         Logger.info("[Session] TX checkout on #{shard}, flushing #{n} buffered packet(s)")
         Enum.each(state.tx_buffer, &:gen_tcp.send(socket, &1))
         Enum.each(1..n, fn _ -> drain_response(socket) end)
-        %{state | tx_socket: socket, tx_shard: shard, tx_buffer: [], tx_entry: entry}
+        {:ok, %{state | tx_socket: socket, tx_shard: shard, tx_buffer: [], tx_entry: entry}}
+
+      {:error, :migrating} ->
+        # Keep the tx_buffer intact — on resume we'll retry flush with the same buffer.
+        {:migrating, hold_packet(raw, shard, state)}
+
       {:error, :empty} ->
         Logger.error("[Session] Pool empty for #{shard} during TX flush")
         send_error(state.client_socket, "pool exhausted for shard #{shard}")
-        %{state | tx_buffer: []}
+        {:ok, %{state | tx_buffer: []}}
     end
   end
 

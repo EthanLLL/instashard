@@ -21,7 +21,7 @@ defmodule Instashard.MixProject do
   def application do
     [
       mod: {Instashard.Application, []},
-      extra_applications: [:logger, :runtime_tools]
+      extra_applications: [:logger, :runtime_tools, :mnesia]
     ]
   end
 

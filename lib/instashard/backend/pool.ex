@@ -22,15 +22,26 @@ defmodule Instashard.Backend.Pool do
     :ets.new(@table, [:public, :ordered_set, :named_table, read_concurrency: true, write_concurrency: true])
   end
 
-  @doc "Return {socket, parse_count, stmt_set} for the given shard, or {:error, :empty}."
+  @doc """
+  Return {socket, parse_count, stmt_set} for the given shard.
+  Returns {:error, :migrating} if the shard's migration gate is not open.
+  Returns {:error, :empty} if no idle connections are available.
+  """
   def checkout(shard) do
+    case Instashard.Backend.MigrationGate.open?(shard) do
+      false -> {:error, :migrating}
+      true  -> do_checkout(shard)
+    end
+  end
+
+  defp do_checkout(shard) do
     ms = [{{{shard, :"$1"}, :_}, [], [:"$1"]}]
 
     case :ets.select(@table, ms, 1) do
       {[ref | _], _cont} ->
         case :ets.take(@table, {shard, ref}) do
           [{_, entry}] -> {:ok, entry}
-          [] -> checkout(shard)
+          [] -> do_checkout(shard)
         end
 
       :"$end_of_table" ->
@@ -60,5 +71,14 @@ defmodule Instashard.Backend.Pool do
   @doc "Count idle connections for a shard."
   def count(shard) do
     :ets.select_count(@table, [{{{shard, :_}, :_}, [], [true]}])
+  end
+
+  @doc "Remove and close all idle connections for a shard. Called before cutover."
+  def flush(shard) do
+    entries = :ets.select(@table, [{{{shard, :_}, :"$1"}, [], [:"$1"]}])
+    :ets.match_delete(@table, {{shard, :_}, :_})
+    Enum.each(entries, fn {socket, _, _} -> :gen_tcp.close(socket) end)
+    Logger.info("[Pool] Flushed #{length(entries)} connections for #{shard}")
+    :ok
   end
 end
