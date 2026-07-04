@@ -1,0 +1,22 @@
+{
+  "databases": [
+    {
+      "database": "my_cluster",
+      "host": "127.0.0.1",
+      "id": "pg-primary-0",
+      "password": "luozhenzuishuai",
+      "pool_size": 1,
+      "port": 5430,
+      "username": "postgres"
+    },
+    {
+      "database": "my_cluster",
+      "host": "127.0.0.1",
+      "id": "pg-primary-1",
+      "password": "luozhenzuishuai",
+      "pool_size": 20,
+      "port": 5431,
+      "username": "postgres"
+    }
+  ]
+}

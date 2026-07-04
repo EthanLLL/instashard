@@ -11,7 +11,7 @@ defmodule Instashard.Backend.Migration do
     :idle          cleanup replication objects
 
   Public API:
-    start_migration(shard, target_db_key)
+    start_migration(shard, target_db_id)
     status(shard)
     drain(shard)
     cutover(shard)
@@ -21,7 +21,7 @@ defmodule Instashard.Backend.Migration do
   use GenServer
   require Logger
 
-  alias Instashard.Backend.{Connection, MigrationGate, Pool, SchemaCloner, ShardMapping}
+  alias Instashard.Backend.{ConfigStore, Connection, DbRegistry, MigrationGate, Pool, SchemaCloner, ShardMapping}
 
   @lag_poll_ms 5_000
   @pub_suffix "_instashard_pub"
@@ -30,10 +30,11 @@ defmodule Instashard.Backend.Migration do
   defstruct [
     phase: :idle,
     shard: nil,
+    target_db_id: nil,
     source_cfg: nil,
     target_cfg: nil,
-    source_socket: nil,  # dedicated connection for replication monitoring
-    target_socket: nil,  # dedicated connection for subscription management
+    source_socket: nil,
+    target_socket: nil,
     lag_bytes: nil,
     error: nil
   ]
@@ -44,8 +45,8 @@ defmodule Instashard.Backend.Migration do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  def start_migration(shard, target_db_key) do
-    GenServer.call(__MODULE__, {:start_migration, shard, target_db_key})
+  def start_migration(shard, target_db_id) do
+    GenServer.call(__MODULE__, {:start_migration, shard, target_db_id})
   end
 
   def status(shard) do
@@ -70,10 +71,11 @@ defmodule Instashard.Backend.Migration do
   def init(_opts), do: {:ok, %__MODULE__{}}
 
   @impl true
-  def handle_call({:start_migration, shard, target_db_key}, _from, %{phase: :idle} = state) do
-    with {:ok, source_cfg} <- ShardMapping.lookup(shard),
-         {:ok, target_cfg} <- lookup_db_config(target_db_key) do
-      new_state = %{state | phase: :preparing, shard: shard,
+  def handle_call({:start_migration, shard, target_db_id}, _from, %{phase: :idle} = state) do
+    with {:ok, source_db_id} <- ShardMapping.lookup(shard),
+         {:ok, source_cfg} <- DbRegistry.get(source_db_id),
+         {:ok, target_cfg} <- DbRegistry.get(target_db_id) do
+      new_state = %{state | phase: :preparing, shard: shard, target_db_id: target_db_id,
                              source_cfg: source_cfg, target_cfg: target_cfg}
       send(self(), :prepare)
       {:reply, :ok, new_state}
@@ -160,15 +162,14 @@ defmodule Instashard.Backend.Migration do
 
   def handle_info(:await_drain, state) do
     nodes = [node() | Node.list()]
-    target_size = Instashard.Backend.Manager.pool_size() * length(nodes)
-    results = :erpc.multicall(nodes, Pool, :count, [state.shard])
-    pool_size = results |> Enum.filter(&match?({:ok, _}, &1)) |> Enum.map(&elem(&1, 1)) |> Enum.sum()
+    results = :erpc.multicall(nodes, Pool, :active_tx_count, [state.shard])
+    active = results |> Enum.filter(&match?({:ok, _}, &1)) |> Enum.map(&elem(&1, 1)) |> Enum.sum()
 
-    if pool_size >= target_size do
-      Logger.info("[Migration] #{state.shard} pool drained across #{length(nodes)} node(s), ready for cutover (lag=#{state.lag_bytes} bytes)")
+    if active == 0 do
+      Logger.info("[Migration] #{state.shard} drained (0 active tx across #{length(nodes)} node(s)), ready for cutover (lag=#{state.lag_bytes} bytes)")
       MigrationGate.set_status(state.shard, :closed)
     else
-      Logger.debug("[Migration] #{state.shard} waiting for drain: #{pool_size}/#{target_size} idle across #{length(nodes)} node(s)")
+      Logger.debug("[Migration] #{state.shard} waiting for drain: #{active} active tx across #{length(nodes)} node(s)")
       Process.send_after(self(), :await_drain, 500)
     end
     {:noreply, state}
@@ -177,18 +178,19 @@ defmodule Instashard.Backend.Migration do
   def handle_info(:do_cutover, state) do
     Logger.info("[Migration] Cutting over #{state.shard} to new db")
 
-    # 1. Update shard→db mapping
-    :ok = ShardMapping.put(state.shard, state.target_cfg)
+    # 1. Update shard→db mapping and persist to file
+    :ok = ShardMapping.put(state.shard, state.target_db_id)
+    case ConfigStore.persist_shards() do
+      :ok -> :ok
+      {:error, reason} -> Logger.error("[Migration] Failed to persist shards.json: #{inspect(reason)}")
+    end
 
-    # 2. Flush old idle connections on all nodes (they point to the old db)
+    # 2. Reopen gate
     nodes = [node() | Node.list()]
-    :erpc.multicall(nodes, Pool, :flush, [state.shard])
-
-    # 3. Reopen gate (points to new db now)
     MigrationGate.set_status(state.shard, :open)
 
-    # 4. Replenish pool on all nodes from new db
-    :erpc.multicall(nodes, Instashard.Backend.Manager, :replenish, [state.shard])
+    # 3. Replenish pool on all nodes from new db
+    :erpc.multicall(nodes, Instashard.Backend.Manager, :replenish, [state.target_db_id])
 
     # 5. Resume waiting sessions
     MigrationGate.notify_waiters(state.shard)
@@ -304,19 +306,6 @@ defmodule Instashard.Backend.Migration do
   end
 
   # ── Config helpers ────────────────────────────────────────────────────
-
-  # Hardcoded for now — same as Manager seed. Will move to a shared config module.
-  @db_configs %{
-    db0: %{host: "127.0.0.1", port: 5430, username: "postgres", password: "luozhenzuishuai", database: "my_cluster"},
-    db1: %{host: "127.0.0.1", port: 5431, username: "postgres", password: "luozhenzuishuai", database: "my_cluster"}
-  }
-
-  defp lookup_db_config(db_key) do
-    case Map.fetch(@db_configs, db_key) do
-      {:ok, cfg} -> {:ok, cfg}
-      :error -> {:error, {:unknown_db, db_key}}
-    end
-  end
 
   defp db_connstr(%{host: h, port: p, username: u, password: pw, database: db}) do
     "host=#{h} port=#{p} dbname=#{db} user=#{u} password=#{pw}"

@@ -2,32 +2,41 @@ defmodule Instashard.Backend.Manager do
   @moduledoc """
   Initialises the connection pool and shard→db mapping.
   Not on the hot path — Pool.checkout/checkin bypass this process entirely.
-  Shard mapping lives in Mnesia (ShardMapping); Manager seeds it at startup.
+
+  Pool size is per-DB (stored in DbRegistry cfg.pool_size).
+  fill_db/1 tops up connections for a db_id up to its configured pool_size.
+
+  Public API for runtime use:
+    replenish(db_id)             — top up pool for a db (called by Pool on socket retire)
+    update_pool_size(db_id, n)   — change pool_size in Mnesia + persist + fill
   """
 
   use GenServer
   require Logger
 
-  @pool_size 5
+  alias Instashard.Backend.{ConfigStore, Connection, DbRegistry, MigrationGate, Pool, ShardMapping, StmtCache}
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @doc "Synchronously replenish connections for a shard. Safe to call before notifying waiters."
-  def replenish(shard), do: GenServer.call(__MODULE__, {:replenish, shard})
+  @doc "Top up connections for a db_id. Called by Pool when a socket is retired."
+  def replenish(db_id), do: GenServer.call(__MODULE__, {:replenish, db_id})
 
-  @doc "Current target pool size per shard."
-  def pool_size, do: @pool_size
+  @doc "Update pool_size for a db, persist to file, and immediately fill to new target."
+  def update_pool_size(db_id, new_size) when is_integer(new_size) and new_size >= 0 do
+    GenServer.call(__MODULE__, {:update_pool_size, db_id, new_size})
+  end
 
   @impl true
   def init(_opts) do
-    Instashard.Backend.Pool.init()
-    Instashard.Backend.StmtCache.init()
-    Instashard.Backend.ShardMapping.init()
-    Instashard.Backend.MigrationGate.init()
+    Pool.init()
+    StmtCache.init()
+    ShardMapping.init()
+    DbRegistry.init()
+    MigrationGate.init()
 
-    seed_mapping()
+    seed_from_files()
 
     send(self(), :fill_pool)
     {:ok, %{}}
@@ -35,56 +44,77 @@ defmodule Instashard.Backend.Manager do
 
   @impl true
   def handle_info(:fill_pool, state) do
-    Instashard.Backend.ShardMapping.all()
-    |> Enum.each(fn {shard, _cfg} -> fill_shard(shard) end)
+    DbRegistry.all()
+    |> Enum.each(fn {db_id, _cfg} -> fill_db(db_id) end)
     {:noreply, state}
   end
 
   @impl true
-  def handle_call({:replenish, shard}, _from, state) do
-    fill_shard(shard)
+  def handle_call({:replenish, db_id}, _from, state) do
+    fill_db(db_id)
     {:reply, :ok, state}
   end
 
-  defp seed_mapping do
-    db_configs = %{
-      db0: %{host: "127.0.0.1", port: 5430, username: "postgres", password: "luozhenzuishuai", database: "my_cluster"},
-      db1: %{host: "127.0.0.1", port: 5431, username: "postgres", password: "luozhenzuishuai", database: "my_cluster"}
-    }
-
-    shard_assignments = %{
-      "shard_0000" => :db0,
-      "shard_0001" => :db1,
-      "shard_0002" => :db0
-    }
-
-    Enum.each(shard_assignments, fn {shard, db_key} ->
-      cfg = Map.fetch!(db_configs, db_key)
-      Instashard.Backend.ShardMapping.put(shard, cfg)
-    end)
+  def handle_call({:update_pool_size, db_id, new_size}, _from, state) do
+    result = with {:ok, cfg} <- DbRegistry.get(db_id) do
+      :ok = DbRegistry.put(db_id, %{cfg | pool_size: new_size})
+      case ConfigStore.persist_databases() do
+        :ok -> :ok
+        {:error, r} -> Logger.error("[Manager] Failed to persist databases.json: #{inspect(r)}")
+      end
+      fill_db(db_id)
+      Logger.info("[Manager] pool_size for #{db_id} updated to #{new_size}")
+      :ok
+    end
+    {:reply, result, state}
   end
 
-  defp fill_shard(shard) do
-    current = Instashard.Backend.Pool.count(shard)
-    needed = @pool_size - current
+  # ── Seed ──────────────────────────────────────────────────────────────
 
-    if needed > 0 do
-      case Instashard.Backend.ShardMapping.lookup(shard) do
-        {:ok, cfg} ->
-          Enum.each(1..needed, fn _ ->
-            case Instashard.Backend.Connection.connect(cfg) do
-              {:ok, socket} ->
-                entry = Instashard.Backend.Pool.new_entry(socket)
-                Instashard.Backend.Pool.checkin(shard, entry)
-                Logger.debug("[Manager] Connected socket for #{shard}")
-              {:error, reason} ->
-                Logger.error("[Manager] Failed to connect for #{shard}: #{inspect(reason)}")
-            end
-          end)
+  defp seed_from_files do
+    case ConfigStore.load_databases() do
+      {:ok, dbs} ->
+        Enum.each(dbs, fn %{id: id} = db ->
+          DbRegistry.put_new(id, Map.drop(db, [:id]))
+        end)
+        Logger.info("[Manager] Seeded #{length(dbs)} database(s) from databases.json")
+      {:error, reason} ->
+        Logger.error("[Manager] Failed to load databases.json: #{inspect(reason)}")
+    end
 
-        {:error, :not_found} ->
-          Logger.error("[Manager] No db config for #{shard}")
-      end
+    case ConfigStore.load_shards() do
+      {:ok, pairs} ->
+        Enum.each(pairs, fn {shard, db_id} -> ShardMapping.put(shard, db_id) end)
+        Logger.info("[Manager] Seeded #{length(pairs)} shard mapping(s) from shards.json")
+      {:error, reason} ->
+        Logger.error("[Manager] Failed to load shards.json: #{inspect(reason)}")
+    end
+  end
+
+  # ── Pool fill ─────────────────────────────────────────────────────────
+
+  defp fill_db(db_id) do
+    case DbRegistry.get(db_id) do
+      {:ok, cfg} ->
+        current = Pool.count(db_id)
+        delta   = cfg.pool_size - current
+        cond do
+          delta > 0 ->
+            Enum.each(1..delta, fn _ ->
+              case Connection.connect(cfg) do
+                {:ok, socket} ->
+                  Pool.put(db_id, Pool.new_entry(socket))
+                  Logger.debug("[Manager] Connected socket for #{db_id}")
+                {:error, reason} ->
+                  Logger.error("[Manager] Failed to connect for #{db_id}: #{inspect(reason)}")
+              end
+            end)
+          delta < 0 ->
+            Pool.trim(db_id, -delta)
+          true -> :ok
+        end
+      {:error, :not_found} ->
+        Logger.error("[Manager] No db config for #{db_id}")
     end
   end
 end
