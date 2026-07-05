@@ -1,4 +1,5 @@
-alias Instashard.Backend.{ConfigStore, DbRegistry, Manager, Migration, MigrationGate, Pool, ShardMapping}
+alias Instashard.Backend.{ConfigStore, DbRegistry, Manager, MigrationGate, Pool, ShardMapping}
+alias Instashard.Migration.{Supervisor, Worker}
 
 defmodule DB do
   def list,                      do: DbRegistry.all()
@@ -26,11 +27,12 @@ defmodule DB do
 end
 
 defmodule M do
-  def migrate(shard, db), do: Migration.start_migration(shard, db)
-  def status(shard),      do: Migration.status(shard)
-  def drain(shard),       do: Migration.drain(shard)
-  def cutover(shard),     do: Migration.cutover(shard)
-  def cancel(shard),      do: Migration.cancel(shard)
+  def migrate(shard, db), do: Supervisor.start_worker(shard, db)
+  def all,                do: Supervisor.all_statuses()
+  def status(shard),      do: Worker.status(shard)
+  def drain(shard),       do: Worker.drain(shard)
+  def cutover(shard),     do: Worker.cutover(shard)
+  def cancel(shard),      do: Worker.cancel(shard)
 
   def gate(shard),        do: MigrationGate.status(shard)
   def active_tx(shard),   do: Pool.active_tx_count(shard)

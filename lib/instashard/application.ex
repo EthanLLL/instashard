@@ -13,7 +13,8 @@ defmodule Instashard.Application do
       {Phoenix.PubSub, name: Instashard.PubSub},
       InstashardWeb.Endpoint,
       Instashard.Backend.Manager,
-      Instashard.Backend.Migration,
+      Instashard.Migration.Registry,
+      Instashard.Migration.Supervisor,
       Instashard.Proxy.SessionSupervisor,
       {Instashard.Proxy.Listener, port: 5400}
     ]

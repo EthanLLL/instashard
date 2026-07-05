@@ -15,15 +15,10 @@ defmodule Instashard.Backend.MigrationGate do
   require Logger
 
   @table :instashard_migration_gate
-  # Local ETS: {shard, pid} bag — sessions waiting for a gate to reopen.
-  @waiters :instashard_migration_waiters
 
-  @dialyzer {:nowarn_function, init: 0, status: 1, set_status: 2, open?: 1,
-             register_waiting: 2, notify_waiters: 1, notify_local_waiters: 1}
+  @dialyzer {:nowarn_function, init: 0, status: 1, set_status: 2, open?: 1, notify_waiters: 1}
 
   def init do
-    :ets.new(@waiters, [:public, :bag, :named_table])
-
     case :mnesia.create_table(@table,
       attributes: [:shard, :status],
       ram_copies: [node()],
@@ -44,7 +39,13 @@ defmodule Instashard.Backend.MigrationGate do
   end
 
   @doc "Set gate status for a shard."
-  def set_status(shard, status) when status in [:open, :closing, :closed] do
+  def set_status(shard, :open) do
+    {:atomic, :ok} = :mnesia.sync_transaction(fn -> :mnesia.write({@table, shard, :open}) end)
+    Logger.info("[MigrationGate] #{shard} → open")
+    :ok
+  end
+
+  def set_status(shard, status) when status in [:closing, :closed] do
     :mnesia.dirty_write({@table, shard, status})
     Logger.info("[MigrationGate] #{shard} → #{status}")
     :ok
@@ -55,26 +56,8 @@ defmodule Instashard.Backend.MigrationGate do
     status(shard) == :open
   end
 
-  @doc "Register a session pid as waiting for this shard's gate to reopen."
-  def register_waiting(shard, pid) do
-    :ets.insert(@waiters, {shard, pid})
-  end
-
-  @doc "Notify waiting sessions on all nodes that the gate is open again."
+  @doc "Broadcast gate open to all waiting sessions across all nodes."
   def notify_waiters(shard) do
-    nodes = [node() | Node.list()]
-    :erpc.multicall(nodes, __MODULE__, :notify_local_waiters, [shard])
-    :ok
-  end
-
-  @doc "Notify waiting sessions on this node only. Called via rpc.multicall."
-  def notify_local_waiters(shard) do
-    pids = :ets.lookup(@waiters, shard) |> Enum.map(fn {_, pid} -> pid end)
-    :ets.delete(@waiters, shard)
-    Enum.each(pids, fn pid ->
-      Instashard.Proxy.ClientSession.migration_resumed(pid, shard)
-    end)
-    Logger.info("[MigrationGate] Notified #{length(pids)} waiting session(s) for #{shard} on #{node()}")
-    :ok
+    Phoenix.PubSub.broadcast(Instashard.PubSub, "gate:#{shard}", {:gate_open, shard})
   end
 end

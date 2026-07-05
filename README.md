@@ -28,21 +28,23 @@ Inspired by [Instagram's 2012 sharding design](https://instagram-engineering.tum
 Client (psql / libpq / asyncpg)
   │ port 5400
   ▼
-Proxy.Listener           TCP accept
-Proxy.SessionSupervisor  DynamicSupervisor
-Proxy.ClientSession      one GenServer per client
-Proxy.ShardRouter        SQL → shard name
+Proxy.Listener              TCP accept
+Proxy.SessionSupervisor     DynamicSupervisor
+Proxy.ClientSession         one GenServer per client
+Proxy.ShardRouter           SQL → shard name
   │
-Backend.Pool             ETS lock-free connection pool
-Backend.Manager          pool replenishment
-Backend.StmtCache        global prepared stmt rewrite (ETS)
-Backend.ShardMapping     shard→db config (Mnesia)
-Backend.MigrationGate    per-shard checkout gate (Mnesia + ETS)
-Backend.Migration        live migration state machine (GenServer)
-Backend.SchemaCloner     DDL copy via pg_catalog
-Backend.Connection       TCP + MD5/SCRAM-SHA-256 auth
-  │                          │
-db0 :5430                db1 :5431
+Backend.Pool                ETS lock-free connection pool
+Backend.Manager             pool replenishment
+Backend.StmtCache           global prepared stmt rewrite (ETS)
+Backend.ShardMapping        shard→db config (Mnesia)
+Backend.MigrationGate       per-shard checkout gate (Mnesia)
+Migration.Supervisor        Horde.DynamicSupervisor for workers
+Migration.Registry          Horde.Registry, one entry per migrating shard
+Migration.Worker            per-shard migration state machine (GenServer)
+Backend.SchemaCloner        DDL copy via pg_catalog
+Backend.Connection          TCP + MD5/SCRAM-SHA-256 auth
+  │                              │
+db0 :5430                   db1 :5431   db2 :5433
 ```
 
 ---
@@ -58,9 +60,10 @@ db0 :5430                db1 :5431
 | Per-shard transactions (lazy checkout) | Done |
 | Prepared statement rewrite + pool reuse | Done |
 | Shard→db mapping (Mnesia) | Done |
-| Live shard migration | Done |
-| Config file for shard mapping | Planned |
-| Migration coordinator HA (Horde / :global) | Planned |
+| Live shard migration (concurrent, per-shard) | Done |
+| Web dashboard (Phoenix Channel + React) | Done |
+| Config file persistence (JSON) | Done |
+| Migration coordinator HA (Horde) | Done |
 
 ---
 
@@ -79,7 +82,7 @@ Client statements are rewritten to internal names (`is_<16-char-hash>`) so the s
 
 ## Live Shard Migration
 
-Online migration between physical databases using PostgreSQL logical replication. Client sessions are transparently held and resumed — no errors, no reconnects.
+Online migration between physical databases using PostgreSQL logical replication. Client sessions are transparently held and resumed — no errors, no reconnects. Multiple shards can be migrated concurrently, each managed by an independent Horde worker.
 
 ### Flow
 
@@ -91,32 +94,62 @@ start_migration(shard, target_db)
   └─ poll replication lag every 5s
 
 drain(shard)
-  └─ gate → :closing (no new checkouts)
-  └─ wait for all nodes' pools to fully drain (in-flight tx finish naturally)
+  └─ gate → :closing (no new checkouts; waiting sessions subscribe via PubSub)
+  └─ wait for all nodes' active tx to reach 0
   └─ gate → :closed
 
 cutover(shard)  [requires lag = 0]
-  └─ update ShardMapping in Mnesia
-  └─ flush old connections on all nodes
-  └─ gate → :open
+  └─ update ShardMapping in Mnesia (sync_transaction, all nodes confirmed)
+  └─ gate → :open (broadcast via PubSub, all waiting sessions resume)
   └─ replenish pool from new db on all nodes
-  └─ notify held sessions → replay buffered pipeline on new db
   └─ cleanup publication, subscription, replication slot
+  └─ DROP SCHEMA CASCADE on source (old data removed)
 ```
+
+### Worker crash recovery
+
+If a migration worker crashes mid-flight, Horde restarts it. On `init`, the worker reads `MigrationGate.status(shard)` to infer the phase and reconnects management sockets:
+
+| Gate status | Recovered phase |
+|---|---|
+| `:open` + subscription exists | `:replicating` |
+| `:closing` | `:draining` |
+| `:closed` | drained, awaiting cutover |
 
 ### IEx helpers
 
 ```elixir
-M.migrate("shard_0002", :db1)   # start migration
-M.status("shard_0002")          # phase, lag_bytes
-M.drain("shard_0002")           # begin drain
-M.cutover("shard_0002")         # cut over (lag must be 0)
-M.cancel("shard_0002")          # abort at any phase
+M.migrate("shard_0002", "pg-primary-1")  # start migration
+M.all()                                   # all active migration statuses
+M.status("shard_0002")                   # phase, lag_bytes, gate
+M.drain("shard_0002")                    # begin drain
+M.cutover("shard_0002")                  # cut over (lag must be 0)
+M.cancel("shard_0002")                   # abort at any phase
 
-M.shards()                      # all shard→db mappings
-M.pool("shard_0002")            # idle connection count
-M.gate("shard_0002")            # :open | :closing | :closed
+M.gate("shard_0002")                     # :open | :closing | :closed
+M.active_tx("shard_0002")               # in-flight tx count on this node
 ```
+
+---
+
+## Web Dashboard
+
+A React + Phoenix Channel dashboard is included for monitoring and managing migrations via browser.
+
+```bash
+# Dev mode (two servers with Vite proxy)
+iex -S mix phx.server       # Phoenix on :4000
+cd frontend && pnpm dev     # Vite on :5173
+
+# Production build (served by Phoenix)
+cd frontend && pnpm build
+```
+
+Features:
+- Live shard → db mapping and pool stats
+- Add databases
+- Start / drain / cutover / cancel migrations per shard
+- Real-time event log per migration
 
 ---
 
@@ -130,7 +163,7 @@ cd db && docker compose up -d
 psql -h 127.0.0.1 -p 5430 -U postgres -d my_cluster -f db/distributed-pg.sql
 psql -h 127.0.0.1 -p 5431 -U postgres -d my_cluster -f db/distributed-pg.sql
 
-# Start proxy
+# Start proxy + web
 iex -S mix phx.server
 
 # Connect via proxy

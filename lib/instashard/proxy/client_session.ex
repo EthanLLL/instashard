@@ -60,7 +60,6 @@ defmodule Instashard.Proxy.ClientSession do
     {:ok, %__MODULE__{client_socket: client_socket}}
   end
 
-  def migration_resumed(pid, shard), do: send(pid, {:migration_resumed, shard})
 
   # ── TCP / control events ──────────────────────────────────────────────
 
@@ -70,12 +69,14 @@ defmodule Instashard.Proxy.ClientSession do
     {:noreply, if(state.waiting, do: state, else: drain_buffer(state))}
   end
 
-  def handle_info({:migration_resumed, shard}, %{waiting_shard: shard} = state) do
+  def handle_info({:gate_open, shard}, %{waiting_shard: shard} = state) do
+    Logger.info("[Session] #{inspect(self())} gate:#{shard} opened, resuming")
+    Phoenix.PubSub.unsubscribe(Instashard.PubSub, "gate:#{shard}")
     state = %{state | waiting: false, waiting_shard: nil, retry_attempt: 0}
     {:noreply, drain_buffer(state)}
   end
 
-  def handle_info({:migration_resumed, _}, state), do: {:noreply, state}
+  def handle_info({:gate_open, _}, state), do: {:noreply, state}
 
   def handle_info({:retry_checkout, attempt}, state) do
     state = %{state | waiting: false, retry_attempt: attempt}
@@ -314,8 +315,8 @@ defmodule Instashard.Proxy.ClientSession do
         drain_buffer(%{state | conn: conn, retry_attempt: 0, stmt_map: new_map})
 
       {:error, :migrating} ->
-        Logger.info("[Session] Shard #{shard} migrating, holding buffer")
-        MigrationGate.register_waiting(shard, self())
+        Logger.info("[Session] #{inspect(self())} shard #{shard} gate closed, subscribing gate:#{shard}")
+        Phoenix.PubSub.subscribe(Instashard.PubSub, "gate:#{shard}")
         %{state | waiting: true, waiting_shard: shard}
 
       {:error, :empty} ->
