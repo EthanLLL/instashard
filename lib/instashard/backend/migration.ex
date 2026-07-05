@@ -22,6 +22,7 @@ defmodule Instashard.Backend.Migration do
   require Logger
 
   alias Instashard.Backend.{ConfigStore, Connection, DbRegistry, MigrationGate, Pool, SchemaCloner, ShardMapping}
+  alias InstashardWeb.AdminChannel
 
   @lag_poll_ms 5_000
   @pub_suffix "_instashard_pub"
@@ -65,6 +66,10 @@ defmodule Instashard.Backend.Migration do
     GenServer.call(__MODULE__, {:cancel, shard})
   end
 
+  def current_status do
+    GenServer.call(__MODULE__, :current_status)
+  end
+
   # ── GenServer ─────────────────────────────────────────────────────────
 
   @impl true
@@ -78,6 +83,7 @@ defmodule Instashard.Backend.Migration do
       new_state = %{state | phase: :preparing, shard: shard, target_db_id: target_db_id,
                              source_cfg: source_cfg, target_cfg: target_cfg}
       send(self(), :prepare)
+      AdminChannel.broadcast_migration_event(shard, "preparing", "source=#{source_db_id} target=#{target_db_id}")
       {:reply, :ok, new_state}
     else
       {:error, reason} -> {:reply, {:error, reason}, state}
@@ -129,6 +135,26 @@ defmodule Instashard.Backend.Migration do
     {:reply, {:error, :not_migrating}, state}
   end
 
+  def handle_call(:current_status, _from, %{phase: :idle} = state) do
+    {:reply, nil, state}
+  end
+
+  def handle_call(:current_status, _from, state) do
+    source_db_id = case state.shard && ShardMapping.lookup(state.shard) do
+      {:ok, id} -> id
+      _ -> nil
+    end
+    status = %{
+      shard: state.shard,
+      source_db_id: source_db_id,
+      target_db_id: state.target_db_id,
+      phase: state.phase,
+      lag_bytes: state.lag_bytes,
+      gate: state.shard && MigrationGate.status(state.shard)
+    }
+    {:reply, status, state}
+  end
+
   # ── Internal messages ─────────────────────────────────────────────────
 
   @impl true
@@ -142,11 +168,13 @@ defmodule Instashard.Backend.Migration do
          :ok <- setup_subscription(tgt, state.shard, state.source_cfg) do
 
       Logger.info("[Migration] #{state.shard} replication started")
+      AdminChannel.broadcast_migration_event(state.shard, "replicating", "replication started")
       Process.send_after(self(), :poll_lag, @lag_poll_ms)
       {:noreply, %{state | phase: :replicating, source_socket: src, target_socket: tgt}}
     else
       {:error, reason} ->
         Logger.error("[Migration] Prepare failed: #{inspect(reason)}")
+        AdminChannel.broadcast_migration_event(state.shard, "error", inspect(reason))
         {:noreply, %{state | phase: :idle, error: reason}}
     end
   end
@@ -154,6 +182,7 @@ defmodule Instashard.Backend.Migration do
   def handle_info(:poll_lag, %{phase: phase} = state) when phase in [:replicating, :draining] do
     lag = query_lag(state.source_socket, state.shard)
     Logger.debug("[Migration] #{state.shard} lag=#{inspect(lag)} bytes")
+    AdminChannel.broadcast_migration_event(state.shard, "lag", "#{inspect(lag)} bytes")
     Process.send_after(self(), :poll_lag, @lag_poll_ms)
     {:noreply, %{state | lag_bytes: lag}}
   end
@@ -168,8 +197,10 @@ defmodule Instashard.Backend.Migration do
     if active == 0 do
       Logger.info("[Migration] #{state.shard} drained (0 active tx across #{length(nodes)} node(s)), ready for cutover (lag=#{state.lag_bytes} bytes)")
       MigrationGate.set_status(state.shard, :closed)
+      AdminChannel.broadcast_migration_event(state.shard, "drained", "ready for cutover, lag=#{state.lag_bytes} bytes")
     else
       Logger.debug("[Migration] #{state.shard} waiting for drain: #{active} active tx across #{length(nodes)} node(s)")
+      AdminChannel.broadcast_migration_event(state.shard, "draining", "#{active} active tx")
       Process.send_after(self(), :await_drain, 500)
     end
     {:noreply, state}
@@ -196,6 +227,7 @@ defmodule Instashard.Backend.Migration do
     MigrationGate.notify_waiters(state.shard)
 
     Logger.info("[Migration] #{state.shard} cutover complete")
+    AdminChannel.broadcast_migration_event(state.shard, "cutover_complete", "now on #{state.target_db_id}")
 
     # 6. Cleanup replication objects (best-effort)
     cleanup_replication(state)
@@ -294,6 +326,7 @@ defmodule Instashard.Backend.Migration do
       MigrationGate.set_status(state.shard, :open)
       MigrationGate.notify_waiters(state.shard)
       cleanup_replication(state)
+      AdminChannel.broadcast_migration_event(state.shard, "cancelled", nil)
       Logger.info("[Migration] #{state.shard} migration cancelled")
     end
     reset_state(state)

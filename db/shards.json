@@ -3,7 +3,9 @@
     "shard_0000"
   ],
   "pg-primary-1": [
-    "shard_0001",
+    "shard_0001"
+  ],
+  "pg-primary-2": [
     "shard_0002"
   ]
 }

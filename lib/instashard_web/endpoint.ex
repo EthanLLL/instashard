@@ -15,6 +15,10 @@ defmodule InstashardWeb.Endpoint do
     websocket: [connect_info: [session: @session_options]],
     longpoll: [connect_info: [session: @session_options]]
 
+  socket "/socket", InstashardWeb.UserSocket,
+    websocket: true,
+    longpoll: false
+
   if code_reloading? do
     plug Phoenix.CodeReloader
   end

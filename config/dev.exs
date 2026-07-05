@@ -9,8 +9,8 @@ import Config
 config :instashard, InstashardWeb.Endpoint,
   # Binding to loopback ipv4 address prevents access from other machines.
   # Change to `ip: {0, 0, 0, 0}` to allow access from other machines.
-  http: [ip: {127, 0, 0, 1}],
-  check_origin: false,
+  http: [ip: {127, 0, 0, 1}, port: 4000],
+  check_origin: ["http://localhost:5173"],
   code_reloader: true,
   debug_errors: true,
   secret_key_base: "/43VVNgXB+Lkda5l/gCCa0EP7OluH8XPUwheDQWC3pLFmvJCuMe9oanbArFr2OKb",
