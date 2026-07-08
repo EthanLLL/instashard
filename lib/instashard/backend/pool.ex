@@ -11,14 +11,13 @@ defmodule Instashard.Backend.Pool do
                Tracks in-flight transactions per shard for migration drain.
 
   Socket replacement: after @replace_threshold prepared statements the socket is
-  closed and Manager is asked to replenish.
+  closed and discarded via Manager.
   """
 
   require Logger
 
   @pool_table :instashard_pool
   @tx_table   :instashard_active_tx
-  @replace_threshold 100
 
   def init do
     :ets.new(@pool_table, [:public, :ordered_set, :named_table, read_concurrency: true, write_concurrency: true])
@@ -52,14 +51,13 @@ defmodule Instashard.Backend.Pool do
   end
 
   defp do_checkout(db_id) do
-    ms = [{{{db_id, :"$1"}, :_}, [], [:"$1"]}]
-    case :ets.select(@pool_table, ms, 1) do
-      {[ref | _], _cont} ->
-        case :ets.take(@pool_table, {db_id, ref}) do
+    case :ets.next(@pool_table, {db_id, 0}) do
+      {^db_id, _} = key ->
+        case :ets.take(@pool_table, key) do
           [{_, entry}] -> {:ok, entry}
-          []           -> do_checkout(db_id)
+          [] -> do_checkout(db_id)
         end
-      :"$end_of_table" ->
+      _ ->
         {:error, :empty}
     end
   end
@@ -67,17 +65,14 @@ defmodule Instashard.Backend.Pool do
   # ── Checkin ───────────────────────────────────────────────────────────
 
   @doc "Return a connection to the pool and decrement active-tx for the shard."
-  def checkin(db_id, shard, {socket, parse_count, _stmt_set} = entry) do
+  def checkin(db_id, shard, entry) do
     decrement_active_tx(shard)
-    if parse_count > @replace_threshold do
-      Logger.info("[Pool] Replacing socket for #{db_id} (parse_count=#{parse_count})")
-      :gen_tcp.close(socket)
-      Instashard.Backend.Manager.replenish(db_id)
-    else
-      :ets.insert(@pool_table, {{db_id, make_ref()}, entry})
-    end
+    :ets.insert(@pool_table, {{db_id, make_ref()}, entry})
     :ok
   end
+
+  @doc "Decrement active-tx for a shard without returning the socket (called by session on backend error)."
+  def decrement_tx(shard), do: decrement_active_tx(shard)
 
   # ── Pool management ───────────────────────────────────────────────────
 

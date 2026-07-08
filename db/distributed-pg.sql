@@ -1,7 +1,7 @@
 -- Create 4096 schemas
 DO $$
 BEGIN
-    FOR i IN 0..2 LOOP
+    FOR i IN 2..2 LOOP
         EXECUTE format('CREATE SCHEMA IF NOT EXISTS shard_%s', to_char(i, 'FM0000'));
     END LOOP;
 END $$;
@@ -9,7 +9,7 @@ END $$;
 -- Create 4096 sequence numbers
 DO $$
 BEGIN
-    FOR i IN 0..2 LOOP
+    FOR i IN 2..2 LOOP
         EXECUTE format('CREATE SEQUENCE IF NOT EXISTS shard_%s.id_sequence', to_char(i, 'FM0000'));
     END LOOP;
 END $$;
@@ -38,7 +38,7 @@ $$ LANGUAGE plpgsql;
 -- Create table inside of each schema
 DO $$
 BEGIN
-    FOR i IN 0..2 LOOP
+    FOR i IN 2..2 LOOP
         EXECUTE format('
             CREATE TABLE IF NOT EXISTS shard_%s.users (
                 id bigint NOT NULL DEFAULT public.generate_snowflake_id(%L),

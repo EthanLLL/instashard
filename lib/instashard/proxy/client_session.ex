@@ -35,7 +35,7 @@ defmodule Instashard.Proxy.ClientSession do
   require Logger
 
   alias __MODULE__.Msg
-  alias Instashard.Backend.{MigrationGate, Pool, StmtCache}
+  alias Instashard.Backend.{Manager, Pool, StmtCache}
   alias Instashard.Proxy.{PgProtocol, ShardRouter}
 
   defstruct [
@@ -49,23 +49,33 @@ defmodule Instashard.Proxy.ClientSession do
     # client_name → {internal_name, shard | nil}
     stmt_map: %{},
     pending_fake_parses: 0,
-    pending_drain_parses: 0
+    pending_drain_parses: 0,
+    partial: <<>>
   ]
 
   def start_link(client_socket), do: GenServer.start_link(__MODULE__, client_socket)
 
   @impl true
   def init(client_socket) do
-    :inet.setopts(client_socket, active: true)
     {:ok, %__MODULE__{client_socket: client_socket}}
   end
 
+  @impl true
+  def terminate(:normal, _state), do: :ok
+  def terminate(:shutdown, _state), do: :ok
+  def terminate({:shutdown, _}, _state), do: :ok
+  def terminate(_reason, _state), do: :ok
 
   # ── TCP / control events ──────────────────────────────────────────────
 
   @impl true
+  def handle_info(:socket_ready, state) do
+    :inet.setopts(state.client_socket, active: true)
+    {:noreply, state}
+  end
+
   def handle_info({:tcp, _sock, data}, state) do
-    state = split_and_enqueue(data, state)
+    state = split_and_enqueue(state.partial <> data, %{state | partial: <<>>})
     {:noreply, if(state.waiting, do: state, else: drain_buffer(state))}
   end
 
@@ -105,7 +115,7 @@ defmodule Instashard.Proxy.ClientSession do
   end
 
   # Startup message (length-prefixed, no type byte)
-  defp do_split(<<len::32, 0, 3, 0, 0, _::binary>> = data, state) do
+  defp do_split(<<len::32, 0, 3, 0, 0, _::binary>> = data, state) when byte_size(data) >= len do
     <<msg::binary-size(len), rest::binary>> = data
     <<_len::32, 0, 3, 0, 0, payload::binary>> = msg
     params = PgProtocol.parse_startup_params(payload)
@@ -122,12 +132,12 @@ defmodule Instashard.Proxy.ClientSession do
         state = preprocess_and_enqueue(<<type, len::32, body::binary>>, state)
         do_split(remaining, state)
       _ ->
-        preprocess_and_enqueue(<<type, len::32, rest::binary>>, state)
+        %{state | partial: <<type, len::32, rest::binary>>}
     end
   end
 
   defp do_split(<<>>, state), do: state
-  defp do_split(data, state), do: preprocess_and_enqueue(data, state)
+  defp do_split(data, state), do: %{state | partial: data}
 
   # ── Pre-process + enqueue ─────────────────────────────────────────────
 
@@ -236,10 +246,15 @@ defmodule Instashard.Proxy.ClientSession do
           inject_fake_parses(state.client_socket, state.pending_fake_parses)
           drain_n_parse_completes(socket, state.pending_drain_parses)
         end
-        if raw, do: :ok = :gen_tcp.send(socket, raw)
-        state = %{state | pending_fake_parses: 0, pending_drain_parses: 0}
-        {rfq_status, state} = read_until_rfq(socket, state, drain?)
-        after_rfq(rfq_status, state)
+        send_result = if raw, do: :gen_tcp.send(socket, raw), else: :ok
+        case send_result do
+          :ok ->
+            state = %{state | pending_fake_parses: 0, pending_drain_parses: 0}
+            {rfq_status, state} = read_until_rfq(socket, state, drain?)
+            after_rfq(rfq_status, state)
+          {:error, reason} ->
+            handle_backend_error(reason, state)
+        end
 
       # Parse: skip if stmt already on this socket, else send
       type == ?P ->
@@ -248,33 +263,52 @@ defmodule Instashard.Proxy.ClientSession do
         if MapSet.member?(stmt_set, internal_name) do
           drain_buffer(%{state | pending_fake_parses: state.pending_fake_parses + 1})
         else
-          :ok = :gen_tcp.send(socket, raw)
-          new_entry = {socket, parse_count + 1, MapSet.put(stmt_set, internal_name)}
-          drain_buffer(%{state | conn: %{conn | entry: new_entry}})
+          case :gen_tcp.send(socket, raw) do
+            :ok ->
+              new_entry = {socket, parse_count + 1, MapSet.put(stmt_set, internal_name)}
+              drain_buffer(%{state | conn: %{conn | entry: new_entry}})
+            {:error, reason} ->
+              handle_backend_error(reason, state)
+          end
         end
 
       # Bind: ensure stmt is on socket (re-parse if needed), then send
       type == ?B ->
         internal_name = bind_stmt_name(raw)
         {_sock, parse_count, stmt_set} = conn.entry
-        {new_entry, extra_drain} =
+        send_result =
           if internal_name && !MapSet.member?(stmt_set, internal_name) do
             sql = StmtCache.lookup_sql(internal_name)
-            :ok = :gen_tcp.send(socket, build_parse(internal_name, sql))
-            new_e = {socket, parse_count + 1, MapSet.put(stmt_set, internal_name)}
-            {new_e, 1}
+            case :gen_tcp.send(socket, build_parse(internal_name, sql)) do
+              :ok ->
+                new_e = {socket, parse_count + 1, MapSet.put(stmt_set, internal_name)}
+                {:ok, new_e, 1}
+              {:error, reason} -> {:error, reason}
+            end
           else
-            {conn.entry, 0}
+            {:ok, conn.entry, 0}
           end
-        :ok = :gen_tcp.send(socket, raw)
-        drain_buffer(%{state | conn: %{conn | entry: new_entry},
-                               pending_drain_parses: state.pending_drain_parses + extra_drain})
+        case send_result do
+          {:ok, new_entry, extra_drain} ->
+            case :gen_tcp.send(socket, raw) do
+              :ok ->
+                drain_buffer(%{state | conn: %{conn | entry: new_entry},
+                                       pending_drain_parses: state.pending_drain_parses + extra_drain})
+              {:error, reason} -> handle_backend_error(reason, state)
+            end
+          {:error, reason} -> handle_backend_error(reason, state)
+        end
 
       # Flush: send + read until flush terminator (no RFQ)
       type == ?H ->
-        :ok = :gen_tcp.send(socket, raw)
-        forward_flush_response(socket, state.client_socket)
-        drain_buffer(state)
+        case :gen_tcp.send(socket, raw) do
+          :ok ->
+            case forward_flush_response(socket, state.client_socket) do
+              :ok -> drain_buffer(state)
+              {:error, reason} -> handle_backend_error(reason, state)
+            end
+          {:error, reason} -> handle_backend_error(reason, state)
+        end
 
       # nil raw (internal placeholder) — skip
       raw == nil ->
@@ -282,10 +316,15 @@ defmodule Instashard.Proxy.ClientSession do
 
       # E, D, C and anything else: send, no recv
       true ->
-        :ok = :gen_tcp.send(socket, raw)
-        drain_buffer(state)
+        case :gen_tcp.send(socket, raw) do
+          :ok -> drain_buffer(state)
+          {:error, reason} -> handle_backend_error(reason, state)
+        end
     end
   end
+
+  # conn is nil when read_until_rfq already called handle_backend_error
+  defp after_rfq(_, %{conn: nil} = state), do: drain_buffer(state)
 
   defp after_rfq(:idle, state) do
     Pool.checkin(state.conn.db_id, state.conn.shard, state.conn.entry)
@@ -334,7 +373,6 @@ defmodule Instashard.Proxy.ClientSession do
     next = state.retry_attempt + 1
     if next <= @max_retry_attempts do
       delay = trunc(:math.pow(2, next - 1))
-      Logger.debug("[Session] Pool empty for #{shard}, retry #{next} in #{delay}ms")
       Process.send_after(self(), {:retry_checkout, next}, delay)
       %{state | waiting: true, waiting_shard: shard, retry_attempt: next}
     else
@@ -396,8 +434,7 @@ defmodule Instashard.Proxy.ClientSession do
 
       {:error, reason} ->
         Logger.error("[Session] Backend recv error: #{inspect(reason)}")
-        send_error(state.client_socket, "backend read error")
-        {:idle, state}
+        {:idle, handle_backend_error(reason, state)}
     end
   end
 
@@ -410,6 +447,7 @@ defmodule Instashard.Proxy.ClientSession do
         if type in @flush_terminators, do: :ok, else: forward_flush_response(backend, client)
       {:error, reason} ->
         Logger.error("[Session] Flush recv: #{inspect(reason)}")
+        {:error, reason}
     end
   end
 
@@ -494,6 +532,22 @@ defmodule Instashard.Proxy.ClientSession do
 
   defp cleanup(%{conn: %{db_id: db, shard: sh, entry: e}}), do: Pool.checkin(db, sh, e)
   defp cleanup(_), do: :ok
+
+  defp handle_backend_error(reason, state) do
+    Logger.error("[Session] Backend error: #{inspect(reason)}")
+    if state.conn do
+      Pool.decrement_tx(state.conn.shard)
+      Manager.discard(state.conn.db_id, state.conn.socket)
+      send_error_08006(state.client_socket, "backend connection failure")
+    end
+    %{state | conn: nil, buffer: [], pending_fake_parses: 0, pending_drain_parses: 0}
+  end
+
+  defp send_error_08006(socket, msg) do
+    body = <<?S, "ERROR", 0, ?V, "ERROR", 0, ?C, "08006", 0, ?M, msg::binary, 0, 0>>
+    :gen_tcp.send(socket, <<?E, (byte_size(body) + 4)::32, body::binary>>)
+    send_ready_for_query(socket, :idle)
+  end
 
   defp drain_n_parse_completes(_socket, 0), do: :ok
   defp drain_n_parse_completes(socket, n) when n > 0 do

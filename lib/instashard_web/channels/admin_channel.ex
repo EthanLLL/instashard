@@ -41,7 +41,7 @@ defmodule InstashardWeb.AdminChannel do
       {:error, :not_found} ->
         DbRegistry.put(id, cfg)
         Instashard.Backend.ConfigStore.persist_databases()
-        Instashard.Backend.Manager.replenish(id)
+        Instashard.Backend.Manager.add_db(id)
         push(socket, "db:ok", %{id: id})
     end
     {:noreply, socket}

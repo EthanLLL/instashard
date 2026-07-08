@@ -73,6 +73,7 @@ defmodule Instashard.Migration.Worker do
     target_db_id = Keyword.fetch!(opts, :target_db_id)
 
     with {:ok, source_db_id} <- ShardMapping.lookup(shard),
+         :ok <- if(source_db_id == target_db_id, do: {:error, :same_db}, else: :ok),
          {:ok, source_cfg} <- DbRegistry.get(source_db_id),
          {:ok, target_cfg} <- DbRegistry.get(target_db_id) do
 
@@ -243,9 +244,7 @@ defmodule Instashard.Migration.Worker do
       {:error, r} -> Logger.error("[Migration] persist_shards failed: #{inspect(r)}")
     end
 
-    nodes = [node() | Node.list()]
     MigrationGate.set_status(state.shard, :open)
-    :erpc.multicall(nodes, Instashard.Backend.Manager, :replenish, [state.target_db_id])
     MigrationGate.notify_waiters(state.shard)
 
     AdminChannel.broadcast_migration_event(state.shard, "cutover_complete",

@@ -14,7 +14,7 @@ defmodule Instashard.Proxy.Listener do
 
   @impl true
   def init(port) do
-    case :gen_tcp.listen(port, [:binary, packet: 0, active: false, reuseaddr: true]) do
+    case :gen_tcp.listen(port, [:binary, :inet, packet: 0, active: false, reuseaddr: true, backlog: 128, nodelay: true]) do
       {:ok, listen_socket} ->
         Logger.info("[Listener] Listening on port #{port}")
         send(self(), :accept)
@@ -29,11 +29,10 @@ defmodule Instashard.Proxy.Listener do
   def handle_info(:accept, %{listen_socket: listen_socket} = state) do
     case :gen_tcp.accept(listen_socket) do
       {:ok, client_socket} ->
-        Logger.info("[Listener] New client connection")
-
         case Instashard.Proxy.SessionSupervisor.start_session(client_socket) do
           {:ok, pid} ->
             :gen_tcp.controlling_process(client_socket, pid)
+            send(pid, :socket_ready)
           {:error, reason} ->
             Logger.error("[Listener] Failed to start session: #{inspect(reason)}")
             :gen_tcp.close(client_socket)

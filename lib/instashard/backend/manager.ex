@@ -1,14 +1,16 @@
 defmodule Instashard.Backend.Manager do
   @moduledoc """
-  Initialises the connection pool and shard→db mapping.
-  Not on the hot path — Pool.checkout/checkin bypass this process entirely.
+  Manages connection pool lifecycle. Not on the hot path.
 
-  Pool size is per-DB (stored in DbRegistry cfg.pool_size).
-  fill_db/1 tops up connections for a db_id up to its configured pool_size.
+  state.pool_sizes = %{db_id => target_count}
 
-  Public API for runtime use:
-    replenish(db_id)             — top up pool for a db (called by Pool on socket retire)
-    update_pool_size(db_id, n)   — change pool_size in Mnesia + persist + fill
+  Pool size is the authoritative target connection count per db, maintained in
+  Manager state. DbRegistry still stores pool_size for persistence but Manager
+  state is the live source of truth.
+
+  Public API:
+    discard(db_id, socket)        — close dead socket, add one replacement
+    update_pool_size(db_id, n)    — adjust target, add/trim connections, persist
   """
 
   use GenServer
@@ -20,10 +22,13 @@ defmodule Instashard.Backend.Manager do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @doc "Top up connections for a db_id. Called by Pool when a socket is retired."
-  def replenish(db_id), do: GenServer.call(__MODULE__, {:replenish, db_id})
+  @doc "Register a newly added db and fill its initial pool."
+  def add_db(db_id), do: GenServer.cast(__MODULE__, {:add_db, db_id})
 
-  @doc "Update pool_size for a db, persist to file, and immediately fill to new target."
+  @doc "Discard a dead socket and add one replacement connection."
+  def discard(db_id, socket), do: GenServer.cast(__MODULE__, {:discard, db_id, socket})
+
+  @doc "Update target pool size for a db, persist to file, add/trim connections."
   def update_pool_size(db_id, new_size) when is_integer(new_size) and new_size >= 0 do
     GenServer.call(__MODULE__, {:update_pool_size, db_id, new_size})
   end
@@ -36,51 +41,79 @@ defmodule Instashard.Backend.Manager do
     DbRegistry.init()
     MigrationGate.init()
 
-    seed_from_files()
+    pool_sizes = seed_from_files()
 
     send(self(), :fill_pool)
-    {:ok, %{}}
+    {:ok, %{pool_sizes: pool_sizes}}
   end
 
   @impl true
   def handle_info(:fill_pool, state) do
-    DbRegistry.all()
-    |> Enum.each(fn {db_id, _cfg} -> fill_db(db_id) end)
+    Enum.each(state.pool_sizes, fn {db_id, n} ->
+      Enum.each(1..n, fn _ -> add_connection(db_id) end)
+    end)
     {:noreply, state}
   end
 
   @impl true
-  def handle_call({:replenish, db_id}, _from, state) do
-    fill_db(db_id)
-    {:reply, :ok, state}
+  def handle_cast({:add_db, db_id}, state) do
+    case DbRegistry.get(db_id) do
+      {:ok, cfg} ->
+        n = cfg.pool_size
+        Enum.each(1..n, fn _ -> add_connection(db_id) end)
+        {:noreply, %{state | pool_sizes: Map.put(state.pool_sizes, db_id, n)}}
+      {:error, :not_found} ->
+        Logger.error("[Manager] add_db: no config for #{db_id}")
+        {:noreply, state}
+    end
   end
 
+  def handle_cast({:discard, db_id, socket}, state) do
+    :gen_tcp.close(socket)
+    add_connection(db_id)
+    {:noreply, state}
+  end
+
+  @impl true
   def handle_call({:update_pool_size, db_id, new_size}, _from, state) do
+    old_size = Map.get(state.pool_sizes, db_id, 0)
+    delta = new_size - old_size
+
     result = with {:ok, cfg} <- DbRegistry.get(db_id) do
       :ok = DbRegistry.put(db_id, %{cfg | pool_size: new_size})
       case ConfigStore.persist_databases() do
         :ok -> :ok
         {:error, r} -> Logger.error("[Manager] Failed to persist databases.json: #{inspect(r)}")
       end
-      fill_db(db_id)
-      Logger.info("[Manager] pool_size for #{db_id} updated to #{new_size}")
+      cond do
+        delta > 0 -> Enum.each(1..delta, fn _ -> add_connection(db_id) end)
+        delta < 0 -> Pool.trim(db_id, -delta)
+        true -> :ok
+      end
+      Logger.info("[Manager] pool_size for #{db_id}: #{old_size} → #{new_size}")
       :ok
     end
-    {:reply, result, state}
+
+    new_sizes = Map.put(state.pool_sizes, db_id, new_size)
+    {:reply, result, %{state | pool_sizes: new_sizes}}
   end
 
   # ── Seed ──────────────────────────────────────────────────────────────
 
+  # Returns %{db_id => pool_size} for Manager state
   defp seed_from_files do
-    case ConfigStore.load_databases() do
-      {:ok, dbs} ->
-        Enum.each(dbs, fn %{id: id} = db ->
-          DbRegistry.put_new(id, Map.drop(db, [:id]))
-        end)
-        Logger.info("[Manager] Seeded #{length(dbs)} database(s) from databases.json")
-      {:error, reason} ->
-        Logger.error("[Manager] Failed to load databases.json: #{inspect(reason)}")
-    end
+    pool_sizes =
+      case ConfigStore.load_databases() do
+        {:ok, dbs} ->
+          Enum.each(dbs, fn %{id: id} = db ->
+            DbRegistry.put_new(id, Map.drop(db, [:id]))
+          end)
+          Logger.info("[Manager] Seeded #{length(dbs)} database(s) from databases.json")
+          Map.new(dbs, fn %{id: id, pool_size: n} -> {id, n} end)
+        {:error, reason} ->
+          Logger.error("[Manager] Failed to load databases.json: #{inspect(reason)}")
+          %{}
+      end
 
     case ConfigStore.load_shards() do
       {:ok, pairs} ->
@@ -89,29 +122,21 @@ defmodule Instashard.Backend.Manager do
       {:error, reason} ->
         Logger.error("[Manager] Failed to load shards.json: #{inspect(reason)}")
     end
+
+    pool_sizes
   end
 
-  # ── Pool fill ─────────────────────────────────────────────────────────
+  # ── Connection management ─────────────────────────────────────────────
 
-  defp fill_db(db_id) do
+  defp add_connection(db_id) do
     case DbRegistry.get(db_id) do
       {:ok, cfg} ->
-        current = Pool.count(db_id)
-        delta   = cfg.pool_size - current
-        cond do
-          delta > 0 ->
-            Enum.each(1..delta, fn _ ->
-              case Connection.connect(cfg) do
-                {:ok, socket} ->
-                  Pool.put(db_id, Pool.new_entry(socket))
-                  Logger.debug("[Manager] Connected socket for #{db_id}")
-                {:error, reason} ->
-                  Logger.error("[Manager] Failed to connect for #{db_id}: #{inspect(reason)}")
-              end
-            end)
-          delta < 0 ->
-            Pool.trim(db_id, -delta)
-          true -> :ok
+        case Connection.connect(cfg) do
+          {:ok, socket} ->
+            Pool.put(db_id, Pool.new_entry(socket))
+            Logger.debug("[Manager] New connection for #{db_id}")
+          {:error, reason} ->
+            Logger.error("[Manager] Failed to connect for #{db_id}: #{inspect(reason)}")
         end
       {:error, :not_found} ->
         Logger.error("[Manager] No db config for #{db_id}")
