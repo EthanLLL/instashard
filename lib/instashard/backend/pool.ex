@@ -32,21 +32,19 @@ defmodule Instashard.Backend.Pool do
   On :empty the caller should schedule a retry with exponential backoff.
   """
   def checkout(shard) do
-    case Instashard.Backend.MigrationGate.open?(shard) do
-      false -> {:error, :migrating}
-      true  ->
-        case Instashard.Backend.ShardMapping.lookup(shard) do
-          {:ok, db_id} ->
-            case do_checkout(db_id) do
-              {:ok, entry} ->
-                :ets.update_counter(@tx_table, shard, {2, 1}, {shard, 0})
-                {:ok, db_id, entry}
-              {:error, :empty} ->
-                {:error, :empty}
-            end
-          {:error, :not_found} ->
-            {:error, :no_mapping}
+    case Instashard.Backend.ShardRoute.route(shard) do
+      {:ok, :open, db_id} ->
+        case do_checkout(db_id) do
+          {:ok, entry} ->
+            :ets.update_counter(@tx_table, shard, {2, 1}, {shard, 0})
+            {:ok, db_id, entry}
+          {:error, :empty} ->
+            {:error, :empty}
         end
+      {:ok, _closing_or_closed, _db_id} ->
+        {:error, :migrating}
+      {:error, :not_found} ->
+        {:error, :no_mapping}
     end
   end
 

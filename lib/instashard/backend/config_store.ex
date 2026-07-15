@@ -8,12 +8,12 @@ defmodule Instashard.Backend.ConfigStore do
 
   Persist (runtime, after Mnesia write):
     persist_databases/0  — dumps DbRegistry → databases.json
-    persist_shards/0     — dumps ShardMapping → shards.json
+    persist_shards/0     — dumps ShardRoute → shards.json
 
   Writes are atomic: write to a tmp file, then rename.
   """
 
-  alias Instashard.Backend.{DbRegistry, ShardMapping}
+  alias Instashard.Backend.{DbRegistry, ShardRoute}
 
   @databases_file "db/databases.json"
   @shards_file "db/shards.json"
@@ -53,10 +53,10 @@ defmodule Instashard.Backend.ConfigStore do
     atomic_write(@databases_file, payload)
   end
 
-  @doc "Dump current ShardMapping to shards.json in {db_id => [shard, ...]} format. Atomic write."
+  @doc "Dump current ShardRoute to shards.json in {db_id => [shard, ...]} format. Atomic write."
   def persist_shards do
     by_db =
-      ShardMapping.all()
+      ShardRoute.all()
       |> Enum.group_by(fn {_shard, db_id} -> db_id end, fn {shard, _} -> shard end)
       |> Enum.map(fn {db_id, shards} -> {db_id, Enum.sort(shards)} end)
       |> Map.new()

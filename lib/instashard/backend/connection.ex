@@ -8,7 +8,7 @@ defmodule Instashard.Backend.Connection do
   def connect(%{host: host, port: port, username: username, password: password, database: database}) do
     host_cl = if is_binary(host), do: String.to_charlist(host), else: host
 
-    with {:ok, socket} <- :gen_tcp.connect(host_cl, port, [:binary, packet: 0, active: false], 5000),
+    with {:ok, socket} <- :gen_tcp.connect(host_cl, port, [:binary, packet: 0, active: false, nodelay: true], 5000),
          :ok <- handshake(socket, username, password, database) do
       {:ok, socket}
     else

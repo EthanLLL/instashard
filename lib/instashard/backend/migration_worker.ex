@@ -1,19 +1,19 @@
 defmodule Instashard.Migration.Worker do
   @moduledoc """
   Per-shard migration worker. Registered in Horde.Registry under the shard name.
-  On restart, recovers phase from MigrationGate status and reconnects sockets.
+  On restart, recovers phase from ShardRoute status and reconnects sockets.
 
   Phases:
     :preparing    schema clone + publication/subscription setup
     :replicating  polling replication lag every 5s
     :draining     gate → :closing, waiting for active_tx → 0
-    :cutting_over update ShardMapping, gate → :open, notify waiters
+    :cutting_over update ShardRoute db_id, gate → :open, notify waiters
   """
 
   use GenServer, restart: :transient
   require Logger
 
-  alias Instashard.Backend.{ConfigStore, Connection, DbRegistry, MigrationGate, Pool, SchemaCloner, ShardMapping}
+  alias Instashard.Backend.{ConfigStore, Connection, DbRegistry, Pool, SchemaCloner, ShardRoute}
   alias InstashardWeb.AdminChannel
 
   @lag_poll_ms 5_000
@@ -72,7 +72,7 @@ defmodule Instashard.Migration.Worker do
     shard = Keyword.fetch!(opts, :shard)
     target_db_id = Keyword.fetch!(opts, :target_db_id)
 
-    with {:ok, source_db_id} <- ShardMapping.lookup(shard),
+    with {:ok, source_db_id} <- ShardRoute.lookup(shard),
          :ok <- if(source_db_id == target_db_id, do: {:error, :same_db}, else: :ok),
          {:ok, source_cfg} <- DbRegistry.get(source_db_id),
          {:ok, target_cfg} <- DbRegistry.get(target_db_id) do
@@ -86,7 +86,7 @@ defmodule Instashard.Migration.Worker do
       }
 
       # Recover phase from gate status (handles worker restart mid-migration)
-      gate = MigrationGate.status(shard)
+      gate = ShardRoute.status(shard)
       state = recover_phase(state, gate)
       {:ok, state}
     else
@@ -143,7 +143,7 @@ defmodule Instashard.Migration.Worker do
 
   @impl true
   def handle_call(:drain, _from, %{phase: :replicating} = state) do
-    MigrationGate.set_status(state.shard, :closing)
+    ShardRoute.set_status(state.shard, :closing)
     send(self(), :await_drain)
     AdminChannel.broadcast_migration_event(state.shard, "draining", "gate closing")
     {:reply, :ok, %{state | phase: :draining}}
@@ -179,7 +179,7 @@ defmodule Instashard.Migration.Worker do
       target_db_id: state.target_db_id,
       phase: state.phase,
       lag_bytes: state.lag_bytes,
-      gate: MigrationGate.status(state.shard)
+      gate: ShardRoute.status(state.shard)
     }
     {:reply, status, state}
   end
@@ -225,7 +225,7 @@ defmodule Instashard.Migration.Worker do
     active = results |> Enum.filter(&match?({:ok, _}, &1)) |> Enum.map(&elem(&1, 1)) |> Enum.sum()
 
     if active == 0 do
-      MigrationGate.set_status(state.shard, :closed)
+      ShardRoute.set_status(state.shard, :closed)
       AdminChannel.broadcast_migration_event(state.shard, "drained",
         "ready for cutover, lag=#{state.lag_bytes} bytes")
     else
@@ -238,14 +238,14 @@ defmodule Instashard.Migration.Worker do
   def handle_info(:do_cutover, state) do
     Logger.info("[Migration] Cutting over #{state.shard} → #{state.target_db_id}")
 
-    :ok = ShardMapping.put(state.shard, state.target_db_id)
+    :ok = ShardRoute.put(state.shard, state.target_db_id)
     case ConfigStore.persist_shards() do
       :ok -> :ok
       {:error, r} -> Logger.error("[Migration] persist_shards failed: #{inspect(r)}")
     end
 
-    MigrationGate.set_status(state.shard, :open)
-    MigrationGate.notify_waiters(state.shard)
+    ShardRoute.set_status(state.shard, :open)
+    ShardRoute.notify_waiters(state.shard)
 
     AdminChannel.broadcast_migration_event(state.shard, "cutover_complete",
       "now on #{state.target_db_id}")
@@ -347,8 +347,8 @@ defmodule Instashard.Migration.Worker do
 
   defp do_cancel(state) do
     if state.phase != :preparing do
-      MigrationGate.set_status(state.shard, :open)
-      MigrationGate.notify_waiters(state.shard)
+      ShardRoute.set_status(state.shard, :open)
+      ShardRoute.notify_waiters(state.shard)
       cleanup_replication(state)
     end
     AdminChannel.broadcast_migration_event(state.shard, "cancelled", nil)

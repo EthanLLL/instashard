@@ -36,8 +36,7 @@ Proxy.ShardRouter           SQL → shard name
 Backend.Pool                ETS lock-free connection pool
 Backend.Manager             pool replenishment
 Backend.StmtCache           global prepared stmt rewrite (ETS)
-Backend.ShardMapping        shard→db config (Mnesia)
-Backend.MigrationGate       per-shard checkout gate (Mnesia)
+Backend.ShardRoute          shard→db + gate status (Mnesia, single read)
 Migration.Supervisor        Horde.DynamicSupervisor for workers
 Migration.Registry          Horde.Registry, one entry per migrating shard
 Migration.Worker            per-shard migration state machine (GenServer)
@@ -59,7 +58,7 @@ db0 :5430                   db1 :5431   db2 :5433
 | ETS lock-free connection pool | Done |
 | Per-shard transactions (lazy checkout) | Done |
 | Prepared statement rewrite + pool reuse | Done |
-| Shard→db mapping (Mnesia) | Done |
+| Shard→db routing + gate (Mnesia, single dirty_read) | Done |
 | Live shard migration (concurrent, per-shard) | Done |
 | Web dashboard (Phoenix Channel + React) | Done |
 | Config file persistence (JSON) | Done |
@@ -76,7 +75,7 @@ Client statements are rewritten to internal names (`is_<16-char-hash>`) so the s
 - Session `stmt_map`: `client_name → {internal_name, shard}`
 - Stmt already on socket → skip Parse, inject fake `ParseComplete` before Sync
 - Bind without preceding Parse → checkout, re-parse on new socket if needed
-- Socket replaced after 100 prepares to bound per-connection state
+- All send-only messages (P/B/E/D/C) collected into a single write; flushed with Sync/Query/Flush
 
 ---
 
@@ -99,7 +98,7 @@ drain(shard)
   └─ gate → :closed
 
 cutover(shard)  [requires lag = 0]
-  └─ update ShardMapping in Mnesia (sync_transaction, all nodes confirmed)
+  └─ update ShardRoute in Mnesia (sync_transaction, all nodes confirmed)
   └─ gate → :open (broadcast via PubSub, all waiting sessions resume)
   └─ replenish pool from new db on all nodes
   └─ cleanup publication, subscription, replication slot
@@ -108,7 +107,7 @@ cutover(shard)  [requires lag = 0]
 
 ### Worker crash recovery
 
-If a migration worker crashes mid-flight, Horde restarts it. On `init`, the worker reads `MigrationGate.status(shard)` to infer the phase and reconnects management sockets:
+If a migration worker crashes mid-flight, Horde restarts it. On `init`, the worker reads `ShardRoute.status(shard)` to infer the phase and reconnects management sockets:
 
 | Gate status | Recovered phase |
 |---|---|
@@ -119,6 +118,14 @@ If a migration worker crashes mid-flight, Horde restarts it. On `init`, the work
 ### IEx helpers
 
 ```elixir
+# Database management
+DB.list()                                 # all registered databases
+DB.shards()                               # all {shard, db_id} mappings
+DB.pool("pg-primary-0")                   # idle connection count
+DB.set_pool_size("pg-primary-0", 30)      # adjust pool size (persisted)
+DB.add("pg-primary-1", "localhost", 5431, "postgres", "postgres", "my_cluster")
+
+# Migration
 M.migrate("shard_0002", "pg-primary-1")  # start migration
 M.all()                                   # all active migration statuses
 M.status("shard_0002")                   # phase, lag_bytes, gate
@@ -183,6 +190,30 @@ COMMIT;
 SELECT * FROM shard_0000.users WHERE id = $1
 \bind 119639312848388098
 \g
+```
+
+---
+
+## Performance
+
+Proxy overhead measured via pgbench (10 clients, macOS loopback, single shard):
+
+| Protocol | Latency (proxy) | Latency (direct) | Overhead |
+|---|---|---|---|
+| Simple query (`-M simple`) | ~0.55 ms | ~0.37 ms | ~0.2 ms |
+| Extended query (`-M prepared`) | ~0.64 ms | ~0.37 ms | ~0.27 ms |
+
+Key optimizations:
+- **Batch send**: all send-only messages (P/B/E/D/C) are collected and flushed in a single `send` with Sync/Query
+- **Batch recv**: backend responses scanned in-memory for ReadyForQuery; forwarded as one iolist
+- **Stmt dedup**: repeated Parses skipped entirely; fake ParseComplete injected into response stream
+- **Lock-free pool**: ETS `ordered_set` with `take` — no GenServer on the checkout path
+- **:queue buffer**: O(1) enqueue/dequeue vs list append
+
+```bash
+# Benchmark extended protocol
+pgbench -h 127.0.0.1 -p 5400 -U postgres -M prepared \
+  -f pgbench/bench_ext_read.sql -c 10 -T 10 -r --no-vacuum
 ```
 
 ---

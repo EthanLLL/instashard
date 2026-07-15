@@ -16,7 +16,7 @@ defmodule Instashard.Backend.Manager do
   use GenServer
   require Logger
 
-  alias Instashard.Backend.{ConfigStore, Connection, DbRegistry, MigrationGate, Pool, ShardMapping, StmtCache}
+  alias Instashard.Backend.{ConfigStore, Connection, DbRegistry, Pool, ShardRoute, StmtCache}
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -37,9 +37,8 @@ defmodule Instashard.Backend.Manager do
   def init(_opts) do
     Pool.init()
     StmtCache.init()
-    ShardMapping.init()
+    ShardRoute.init()
     DbRegistry.init()
-    MigrationGate.init()
 
     pool_sizes = seed_from_files()
 
@@ -117,7 +116,7 @@ defmodule Instashard.Backend.Manager do
 
     case ConfigStore.load_shards() do
       {:ok, pairs} ->
-        Enum.each(pairs, fn {shard, db_id} -> ShardMapping.put(shard, db_id) end)
+        Enum.each(pairs, fn {shard, db_id} -> ShardRoute.put(shard, db_id) end)
         Logger.info("[Manager] Seeded #{length(pairs)} shard mapping(s) from shards.json")
       {:error, reason} ->
         Logger.error("[Manager] Failed to load shards.json: #{inspect(reason)}")

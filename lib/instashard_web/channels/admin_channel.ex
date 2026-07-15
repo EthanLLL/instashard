@@ -2,7 +2,7 @@ defmodule InstashardWeb.AdminChannel do
   use Phoenix.Channel
   require Logger
 
-  alias Instashard.Backend.{DbRegistry, MigrationGate, Pool, ShardMapping}
+  alias Instashard.Backend.{DbRegistry, Pool, ShardRoute}
   alias Instashard.Migration.{Supervisor, Worker}
 
   @impl true
@@ -135,10 +135,10 @@ defmodule InstashardWeb.AdminChannel do
     dbs = DbRegistry.all() |> Enum.map(fn {id, cfg} ->
       %{id: id, host: cfg.host, port: cfg.port, pool_size: cfg.pool_size, idle: Pool.count(id)}
     end)
-    shards = ShardMapping.all() |> Enum.map(fn {shard, db_id} ->
+    shards = ShardRoute.all() |> Enum.map(fn {shard, db_id} ->
       %{shard: shard, db_id: db_id,
         active_tx: Pool.active_tx_count(shard),
-        gate: MigrationGate.status(shard) |> to_string()}
+        gate: ShardRoute.status(shard) |> to_string()}
     end)
     %{dbs: dbs, shards: shards}
   end

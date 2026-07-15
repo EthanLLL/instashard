@@ -1,16 +1,17 @@
-alias Instashard.Backend.{ConfigStore, DbRegistry, Manager, MigrationGate, Pool, ShardMapping}
+alias Instashard.Backend.{ConfigStore, DbRegistry, Manager, Pool, ShardRoute, StmtCache}
 alias Instashard.Migration.{Supervisor, Worker}
 
 defmodule DB do
   def list,                      do: DbRegistry.all()
   def get(id),                   do: DbRegistry.get(id)
   def pool(id),                  do: Pool.count(id)
-  def shards,                    do: ShardMapping.all()
+  def shards,                    do: ShardRoute.all()
 
   def add(id, host, port, user, pass, db, pool_size \\ 20) do
     cfg = %{host: host, port: port, username: user, password: pass, database: db, pool_size: pool_size}
     with :ok <- DbRegistry.put(id, cfg),
          :ok <- ConfigStore.persist_databases() do
+      Manager.add_db(id)
       :ok
     end
   end
@@ -18,6 +19,7 @@ defmodule DB do
   def remove(id) do
     with :ok <- DbRegistry.delete(id),
          :ok <- ConfigStore.persist_databases() do
+      Pool.flush(id)
       :ok
     end
   end
@@ -34,6 +36,6 @@ defmodule M do
   def cutover(shard),     do: Worker.cutover(shard)
   def cancel(shard),      do: Worker.cancel(shard)
 
-  def gate(shard),        do: MigrationGate.status(shard)
+  def gate(shard),        do: ShardRoute.status(shard)
   def active_tx(shard),   do: Pool.active_tx_count(shard)
 end
