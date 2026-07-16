@@ -196,24 +196,37 @@ SELECT * FROM shard_0000.users WHERE id = $1
 
 ## Performance
 
-Proxy overhead measured via pgbench (10 clients, macOS loopback, single shard):
+Benchmarked with pgbench (10 clients, 4 threads, 30s, pool size 10, single shard SELECT).
 
-| Protocol | Latency (proxy) | Latency (direct) | Overhead |
-|---|---|---|---|
-| Simple query (`-M simple`) | ~0.55 ms | ~0.37 ms | ~0.2 ms |
-| Extended query (`-M prepared`) | ~0.64 ms | ~0.37 ms | ~0.27 ms |
+**Environment**: all instances in the same AZ (us-west-2d)
 
-Key optimizations:
-- **Batch send**: all send-only messages (P/B/E/D/C) are collected and flushed in a single `send` with Sync/Query
+| Role | Instance |
+|---|---|
+| pgbench client | c9g.large |
+| InstaShard / pgbouncer | c8g.large |
+| Aurora PostgreSQL | r8g.large |
+
+**Results**:
+
+| Protocol | Direct | InstaShard | pgbouncer 1.25 | InstaShard overhead |
+|---|---|---|---|---|
+| Simple (`-M simple`) | 0.348 ms | 0.504 ms | 0.463 ms | +0.156 ms |
+| Extended (`-M extended`) | 0.271 ms | 0.482 ms | 0.498 ms | +0.211 ms |
+| Prepared (`-M prepared`) | 0.271 ms | 0.482 ms | 0.504 ms | +0.211 ms |
+
+InstaShard matches or beats pgbouncer on extended/prepared protocols despite doing shard routing, statement rewrite, and migration gating. The advantage comes from cross-transaction prepared statement reuse — the same SQL hitting the same backend socket skips Parse entirely, while pgbouncer (transaction mode) loses stmt state on every checkin.
+
+**Key optimizations**:
+- **Batch send**: all send-only messages (P/B/E/D/C) collected and flushed in one `writev` with Sync
 - **Batch recv**: backend responses scanned in-memory for ReadyForQuery; forwarded as one iolist
-- **Stmt dedup**: repeated Parses skipped entirely; fake ParseComplete injected into response stream
-- **Lock-free pool**: ETS `ordered_set` with `take` — no GenServer on the checkout path
-- **:queue buffer**: O(1) enqueue/dequeue vs list append
+- **Stmt dedup**: repeated Parses skipped; fake ParseComplete injected into response stream
+- **Lock-free pool**: ETS `ordered_set` + `take` — no GenServer on the checkout path
+- **:queue buffer**: O(1) enqueue/dequeue, no list copy
 
 ```bash
-# Benchmark extended protocol
-pgbench -h 127.0.0.1 -p 5400 -U postgres -M prepared \
-  -f pgbench/bench_ext_read.sql -c 10 -T 10 -r --no-vacuum
+# Reproduce
+pgbench -h proxy-host -p 5431 -U postgres -M prepared \
+  -f pgbench/bench_ext_read.sql -c 10 -j 4 -T 30 -r --no-vacuum my_cluster
 ```
 
 ---
